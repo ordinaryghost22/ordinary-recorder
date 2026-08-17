@@ -1,0 +1,23 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('recorder', {
+  getSettings: () => ipcRenderer.invoke('get-settings'),
+  saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+  listAudioDevices: () => ipcRenderer.invoke('list-audio-devices'),
+  start: () => ipcRenderer.invoke('start-recording'),
+  stop: () => ipcRenderer.invoke('stop-recording'),
+  pause: () => ipcRenderer.invoke('pause-recording'),
+  resume: () => ipcRenderer.invoke('resume-recording'),
+  toggleInstantReplay: (enable) => ipcRenderer.invoke('toggle-instant-replay', enable),
+  saveReplay: (saveMinutes) => ipcRenderer.invoke('save-instant-replay', saveMinutes),
+  getInstantReplayState: () => ipcRenderer.invoke('get-instant-replay-state'),
+  getState: () => ipcRenderer.invoke('get-state'),
+  chooseFolder: () => ipcRenderer.invoke('choose-folder'),
+  openFolder: () => ipcRenderer.invoke('open-folder'),
+  listRecordings: () => ipcRenderer.invoke('list-recordings'),
+  openRecording: (filePath) => ipcRenderer.invoke('open-recording', filePath),
+  showRecording: (filePath) => ipcRenderer.invoke('show-recording', filePath),
+  onStateChange: (callback) => ipcRenderer.on('recording-state', (_event, data) => callback(data)),
+  onReplayStateChange: (callback) => ipcRenderer.on('instant-replay-state', (_event, data) => callback(data)),
+  setHotkeyCapture: (enable) => ipcRenderer.invoke('set-hotkey-capture', enable)
+});

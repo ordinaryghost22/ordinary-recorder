@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ordinary Recorder</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app" id="appRoot">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true">O</span>
+        <div class="brand-text">
+          <div class="brand-name">ORDINARY</div>
+          <div class="brand-sub">RECORDER</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Main">
+        <button type="button" class="nav-item active" data-nav="recorder">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg>
+          Recorder
+        </button>
+        <button type="button" class="nav-item" data-nav="clips">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/></svg>
+          Clips
+        </button>
+        <button type="button" class="nav-item" data-nav="hotkeys">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/><path d="M7 16h10"/></svg>
+          Hotkeys
+        </button>
+        <button type="button" class="nav-item" data-nav="settings">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+          Settings
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="foot-name">Ordinary Recorder</div>
+        <div class="foot-meta">
+          <span>v2.0.0</span>
+          <span class="foot-dot" id="footDot" aria-hidden="true"></span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="main-inner">
+
+        <!-- Recorder -->
+        <section class="view" data-view="recorder">
+          <header class="page-header">
+            <div>
+              <h1 class="page-title">Recorder</h1>
+              <p class="page-desc">Record your gameplay in high quality.</p>
+            </div>
+            <button type="button" class="btn-quiet hotkey-reset" id="hotkeyReset">Reset Defaults</button>
+          </header>
+
+          <div class="status-panel" id="statusPanel">
+            <div class="status-left">
+              <span class="status-dot" id="statusDot" title="Status"></span>
+              <div class="status-copy">
+                <div class="status-title" id="statusTitle">Ready to record</div>
+                <div class="status-sub" id="statusLine">Everything is set. Press the button to start.</div>
+                <div class="rec-meters" id="liveStats" hidden>
+                  <div class="rec-meter">
+                    <div class="rec-meter-value" id="timerDisplay">00:00</div>
+                    <div class="rec-meter-label">Elapsed</div>
+                  </div>
+                  <div class="rec-meter">
+                    <div class="rec-meter-value" id="sizeDisplay">0 B</div>
+                    <div class="rec-meter-label">Size</div>
+                  </div>
+                  <div class="rec-meter rec-meter-aux">
+                    <div class="rec-meter-value rec-meter-aux-row">
+                      <span id="fpsDisplay" hidden></span>
+                      <span class="stats-sep" id="fpsSep" hidden></span>
+                      <span id="audioDisplay" hidden></span>
+                      <span class="stats-sep" id="audioSep" hidden></span>
+                    </div>
+                    <div class="rec-meter-label">Capture</div>
+                  </div>
+                </div>
+                <div class="buffer-bar" id="replayIndicator" hidden>
+                  <span class="buffer-pip"></span>
+                  <span id="replayIndicatorText">Buffer live</span>
+                </div>
+                <div class="ptt-live" id="pttLive" hidden>Mic live</div>
+              </div>
+            </div>
+            <div class="status-actions">
+              <button type="button" id="pauseBtn" class="btn-secondary pause-btn" disabled hidden>
+                <span id="pauseBtnLabel">Pause</span>
+              </button>
+              <button type="button" id="recordBtn" class="btn-primary record-btn">
+                <span id="recordBtnLabel">Start Recording</span>
+                <span class="btn-keys" id="recKeyHint"></span>
+              </button>
+            </div>
+          </div>
+
+          <div class="keys" id="keysBar" hidden>
+            <span class="mic-chip" id="pttHint">Mic on</span>
+          </div>
+
+          <section class="section">
+            <h2 class="section-title">Shortcuts</h2>
+            <p class="hotkey-note" id="hotkeyNote">Click a shortcut, then press the new keys. Esc cancels.</p>
+            <div class="shortcut-grid">
+              <button type="button" class="shortcut-card hotkey-btn" id="hotkeyRecord" data-bind="hotkey">
+                <span class="shortcut-label">Record / Stop</span>
+                <span class="shortcut-keys"></span>
+                <span class="esc-hint">Esc to cancel</span>
+              </button>
+              <button type="button" class="shortcut-card hotkey-btn" id="hotkeyPause" data-bind="pauseHotkey">
+                <span class="shortcut-label">Pause / Resume</span>
+                <span class="shortcut-keys"></span>
+                <span class="esc-hint">Esc to cancel</span>
+              </button>
+              <button type="button" class="shortcut-card hotkey-btn" id="hotkeyClip" data-bind="replayHotkey">
+                <span class="shortcut-label">Clip Replay</span>
+                <span class="shortcut-keys"></span>
+                <span class="esc-hint">Esc to cancel</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="section">
+            <h2 class="section-title">Live Recording</h2>
+            <p class="section-desc">Used when you press Start Recording or Ctrl+Shift+R.</p>
+            <div class="settings-surface">
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Microphone</div>
+                  <div class="row-desc">Voice capture while recording</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="pttKeySelect" tabindex="-1" aria-hidden="true">
+                    <option value="Always" selected>Always On</option>
+                    <option value="V">Hold V</option>
+                    <option value="Mouse4">Hold Mouse 4</option>
+                    <option value="Mouse5">Hold Mouse 5</option>
+                    <option value="Grave">Hold ~</option>
+                    <option value="Alt">Hold Alt</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">Always On</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="Always">Always On</button>
+                    <button type="button" class="select-option" role="option" data-value="V">Hold V</button>
+                    <button type="button" class="select-option" role="option" data-value="Mouse4">Hold Mouse 4</button>
+                    <button type="button" class="select-option" role="option" data-value="Mouse5">Hold Mouse 5</button>
+                    <button type="button" class="select-option" role="option" data-value="Grave">Hold ~</button>
+                    <button type="button" class="select-option" role="option" data-value="Alt">Hold Alt</button>
+                  </div>
+                </div>
+              </div>
+              <label class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Game Audio</div>
+                  <div class="row-desc">Capture system and in-game sound</div>
+                </div>
+                <input type="checkbox" id="recordAudio" class="switch-input" checked>
+                <span class="switch"></span>
+              </label>
+              <label class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Smaller Files</div>
+                  <div class="row-desc">Prefer a more efficient encode</div>
+                </div>
+                <input type="checkbox" id="spaceSaving" class="switch-input" checked>
+                <span class="switch"></span>
+              </label>
+              <label class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Mouse Cursor</div>
+                  <div class="row-desc">Include the cursor in recordings</div>
+                </div>
+                <input type="checkbox" id="drawMouse" class="switch-input" checked>
+                <span class="switch"></span>
+              </label>
+            </div>
+          </section>
+
+          <section class="section">
+            <h2 class="section-title">Instant Replay</h2>
+            <p class="section-desc">Always-on buffer. Clip a moment without starting a full recording.</p>
+            <div class="settings-surface">
+              <label class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Instant Replay</div>
+                  <div class="row-desc">Keep the last few minutes in memory</div>
+                </div>
+                <input type="checkbox" id="instantReplayToggle" class="switch-input">
+                <span class="switch"></span>
+              </label>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Buffer Length</div>
+                  <div class="row-desc">How much gameplay to keep rolling</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="replayBufferSelect" tabindex="-1" aria-hidden="true">
+                    <option value="1">1 min</option>
+                    <option value="2">2 min</option>
+                    <option value="3">3 min</option>
+                    <option value="4">4 min</option>
+                    <option value="5" selected>5 min</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">5 min</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="1">1 min</button>
+                    <button type="button" class="select-option" role="option" data-value="2">2 min</button>
+                    <button type="button" class="select-option" role="option" data-value="3">3 min</button>
+                    <button type="button" class="select-option" role="option" data-value="4">4 min</button>
+                    <button type="button" class="select-option" role="option" data-value="5">5 min</button>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Clip Length</div>
+                  <div class="row-desc">How much of the buffer to save</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="replaySaveSelect" tabindex="-1" aria-hidden="true">
+                    <option value="0.5">30 sec</option>
+                    <option value="1">1 min</option>
+                    <option value="2" selected>2 min</option>
+                    <option value="3">3 min</option>
+                    <option value="4">4 min</option>
+                    <option value="5">5 min</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">2 min</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="0.5">30 sec</button>
+                    <button type="button" class="select-option" role="option" data-value="1">1 min</button>
+                    <button type="button" class="select-option" role="option" data-value="2">2 min</button>
+                    <button type="button" class="select-option" role="option" data-value="3">3 min</button>
+                    <button type="button" class="select-option" role="option" data-value="4">4 min</button>
+                    <button type="button" class="select-option" role="option" data-value="5">5 min</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <p class="replay-note" id="replayNote">Stay in the game and press Ctrl+Shift+I to save a clip.</p>
+          </section>
+
+          <section class="section">
+            <h2 class="section-title">Library</h2>
+            <div class="library-row">
+              <div class="library-copy">
+                <svg class="folder-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></svg>
+                <div>
+                  <div class="row-label">Recording Folder</div>
+                  <div class="folder-path" id="folderPath" data-folder-path></div>
+                </div>
+              </div>
+              <div class="library-actions">
+                <button type="button" id="folderBtn" class="btn-quiet">Change</button>
+                <button type="button" id="openFolderBtn" class="btn-secondary">Open Folder</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <!-- Clips -->
+        <section class="view" data-view="clips" hidden>
+          <header class="page-header">
+            <div>
+              <h1 class="page-title">Clips</h1>
+              <p class="page-desc">Recordings saved to your library.</p>
+            </div>
+            <div class="library-actions">
+              <button type="button" id="saveReplayBtn" class="btn-secondary clip-btn" disabled>
+                <span id="saveReplayLabel">Clip Last 2 Min</span>
+              </button>
+              <span id="clipKeyHint" hidden></span>
+              <button type="button" class="btn-secondary js-open-folder">Open Folder</button>
+            </div>
+          </header>
+
+          <div class="library-row library-row-compact">
+            <div class="library-copy">
+              <svg class="folder-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></svg>
+              <div>
+                <div class="row-label">Recording Folder</div>
+                <div class="folder-path" data-folder-path></div>
+              </div>
+            </div>
+            <button type="button" class="btn-quiet js-folder-btn">Change</button>
+          </div>
+
+          <div class="clips-list" id="clipsList"></div>
+        </section>
+
+        <!-- Hotkeys -->
+        <section class="view" data-view="hotkeys" hidden>
+          <header class="page-header">
+            <div>
+              <h1 class="page-title">Hotkeys</h1>
+              <p class="page-desc">Click a shortcut, then press the new keys.</p>
+            </div>
+            <button type="button" class="btn-quiet js-hotkey-reset">Reset Defaults</button>
+          </header>
+
+          <p class="hotkey-note js-hotkey-note">These shortcuts work while you are in game.</p>
+
+          <div class="settings-surface">
+            <button type="button" class="setting-row hotkey-btn" data-bind="hotkey">
+              <div class="row-copy">
+                <div class="row-label">Record / Stop</div>
+                <div class="row-desc">Start or stop a recording</div>
+                <span class="esc-hint">Esc to cancel</span>
+              </div>
+              <span class="hotkey-keys shortcut-keys"></span>
+            </button>
+            <button type="button" class="setting-row hotkey-btn" data-bind="pauseHotkey">
+              <div class="row-copy">
+                <div class="row-label">Pause / Resume</div>
+                <div class="row-desc">Pause an active recording</div>
+                <span class="esc-hint">Esc to cancel</span>
+              </div>
+              <span class="hotkey-keys shortcut-keys"></span>
+            </button>
+            <button type="button" class="setting-row hotkey-btn" data-bind="replayHotkey">
+              <div class="row-copy">
+                <div class="row-label">Clip Replay</div>
+                <div class="row-desc">Save the current replay buffer</div>
+                <span class="esc-hint">Esc to cancel</span>
+              </div>
+              <span class="hotkey-keys shortcut-keys"></span>
+            </button>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section class="view" data-view="settings" hidden>
+          <header class="page-header">
+            <div>
+              <h1 class="page-title">Settings</h1>
+              <p class="page-desc">Capture, audio, and where files are saved.</p>
+            </div>
+          </header>
+
+          <section class="section">
+            <h2 class="section-title">Capture</h2>
+            <p class="section-desc">These apply to live recordings and Instant Replay.</p>
+            <div class="settings-surface">
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Frame Rate</div>
+                  <div class="row-desc">Higher fps is smoother and uses more disk</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="fpsSelect" tabindex="-1" aria-hidden="true">
+                    <option value="30" selected>30 fps</option>
+                    <option value="60">60 fps</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">30 fps</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="30">30 fps</button>
+                    <button type="button" class="select-option" role="option" data-value="60">60 fps</button>
+                  </div>
+                </div>
+              </div>
+              <label class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Game Capture</div>
+                  <div class="row-desc">Optimize encode for gameplay</div>
+                </div>
+                <input type="checkbox" id="gameModeToggle" class="switch-input" checked>
+                <span class="switch"></span>
+              </label>
+              <label class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Exclusive Fullscreen</div>
+                  <div class="row-desc">On if the game is exclusive fullscreen. Borderless is more reliable</div>
+                </div>
+                <input type="checkbox" id="exclusiveFullscreenToggle" class="switch-input" checked>
+                <span class="switch"></span>
+              </label>
+            </div>
+          </section>
+
+          <section class="section">
+            <h2 class="section-title">Audio</h2>
+            <p class="section-desc">Pick how game sound and voice are captured.</p>
+            <div class="settings-surface">
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Audio Source</div>
+                  <div class="row-desc">Game audio needs Stereo Mix or VB-Cable</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="audioSourceSelect" tabindex="-1" aria-hidden="true">
+                    <option value="system" selected>Game + voice</option>
+                    <option value="mic">Microphone only</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">Game + voice</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="system">Game + voice</button>
+                    <button type="button" class="select-option" role="option" data-value="mic">Microphone only</button>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Audio Device</div>
+                  <div class="row-desc">CABLE Output or Stereo Mix for game sound</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="audioDeviceSelect" tabindex="-1" aria-hidden="true">
+                    <option value="">Detecting…</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">Detecting…</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="">Detecting…</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <p class="replay-note" id="audioHint">If game sound is missing, install VB-Audio Cable or enable Stereo Mix.</p>
+          </section>
+
+          <section class="section">
+            <h2 class="section-title">Library</h2>
+            <div class="library-row">
+              <div class="library-copy">
+                <svg class="folder-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></svg>
+                <div>
+                  <div class="row-label">Recording Folder</div>
+                  <div class="folder-path" data-folder-path></div>
+                </div>
+              </div>
+              <div class="library-actions">
+                <button type="button" class="btn-quiet js-folder-btn">Change</button>
+                <button type="button" class="btn-secondary js-open-folder">Open Folder</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

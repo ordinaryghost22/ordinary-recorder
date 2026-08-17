@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Game Capture</title>
+</head>
+<body>
+  <script>
+    (async () => {
+      const params = new URLSearchParams(location.search);
+      const sourceId = params.get('sourceId');
+      const fps = Math.min(30, Math.max(15, Number(params.get('fps') || 30)));
+      const withAudio = params.get('audio') === '1';
+      let pttEnabled = params.get('ptt') === '1';
+      const bitrate = Number(params.get('bitrate') || 8_000_000);
+
+      const screenId = params.get('screenId') || '';
+      const sourceIds = [sourceId, screenId].filter((id, i, arr) => id && arr.indexOf(id) === i);
+
+      if (!sourceId) {
+        window.gameCapture.failed('No capture source');
+        return;
+      }
+
+      let running = true;
+      let encoder = null;
+      let audioCtx = null;
+      let stream = null;
+      let micStream = null;
+      let micGain = null;
+      let statsTimer = null;
+      let keepAliveTimer = null;
+      let framesIn = 0;
+      let framesEncoded = 0;
+      let lastStats = Date.now();
+      let pttHeld = false;
+      let audioPeak = 0;
+      let hasLoopback = false;
+      let hasMic = false;
+      let captureSampleRate = 48000;
+
+      const WORKLET_SRC = `
+        class PcmCapture extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this._chunks = [];
+            this._samples = 0;
+            this._target = 2048;
+            this._peak = 0;
+          }
+          process(inputs) {
+            const input = inputs[0];
+            if (!input || !input[0] || !input[0].length) return true;
+            const left = input[0];
+            const right = input[1] || left;
+            const frames = left.length;
+            const interleaved = new Int16Array(frames * 2);
+            for (let i = 0; i < frames; i++) {
+              const l = left[i];
+              const r = right[i];
+              const al = Math.abs(l);
+              const ar = Math.abs(r);
+              if (al > this._peak) this._peak = al;
+              if (ar > this._peak) this._peak = ar;
+              const ls = l * 32767;
+              const rs = r * 32767;
+              interleaved[i * 2] = ls < -32768 ? -32768 : ls > 32767 ? 32767 : ls;
+              interleaved[i * 2 + 1] = rs < -32768 ? -32768 : rs > 32767 ? 32767 : rs;
+            }
+            this._chunks.push(interleaved);
+            this._samples += frames;
+            if (this._samples >= this._target) {
+              const out = new Int16Array(this._samples * 2);
+              let o = 0;
+              for (const c of this._chunks) {
+                out.set(c, o);
+                o += c.length;
+              }
+              const peak = this._peak;
+              this._chunks = [];
+              this._samples = 0;
+              this._peak = 0;
+              this.port.postMessage({ pcm: out.buffer, peak }, [out.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor('pcm-capture', PcmCapture);
+      `;
+
+      const applyMicGain = () => {
+        if (!micGain || !audioCtx) return;
+        const open = !pttEnabled || pttHeld;
+        try {
+          micGain.gain.cancelScheduledValues(audioCtx.currentTime);
+          micGain.gain.setTargetAtTime(open ? 1 : 0, audioCtx.currentTime, 0.015);
+        } catch (e) { /* ignore */ }
+      };
+
+      const setMicOpen = (held) => {
+        pttHeld = Boolean(held);
+        applyMicGain();
+      };
+
+      window.gameCapture.onPtt(setMicOpen);
+      window.gameCapture.onAudioMode((mode) => {
+        if (!mode || typeof mode !== 'object') return;
+        pttEnabled = Boolean(mode.pttEnabled);
+        if (typeof mode.held === 'boolean') pttHeld = mode.held;
+        applyMicGain();
+      });
+
+      const mode = params.get('mode') || 'medal';
+      let mediaRecorder = null;
+
+      const stopAll = async () => {
+        running = false;
+        if (statsTimer) clearInterval(statsTimer);
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (e) { /* ignore */ }
+        try { if (encoder && encoder.state !== 'closed') await encoder.flush(); } catch (e) { /* ignore */ }
+        try { if (encoder && encoder.state !== 'closed') encoder.close(); } catch (e) { /* ignore */ }
+        try { if (audioCtx) await audioCtx.close(); } catch (e) { /* ignore */ }
+        try { if (stream) stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
+        try { if (micStream) micStream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
+        window.gameCapture.stopped();
+      };
+
+      window.gameCapture.registerStop(stopAll);
+
+      const videoFor = (id) => ({
+        chromeMediaSource: 'desktop',
+        chromeMediaSourceId: id,
+        maxFrameRate: fps,
+        maxWidth: 2560,
+        maxHeight: 1440
+      });
+
+      async function captureDesktopStream() {
+        const tryGum = async (id, audioConstraint) => navigator.mediaDevices.getUserMedia({
+          audio: audioConstraint,
+          video: { mandatory: videoFor(id) }
+        });
+
+        for (const id of sourceIds) {
+          if (withAudio) {
+            try {
+              const s = await tryGum(id, { mandatory: { chromeMediaSource: 'desktop' } });
+              if (s.getVideoTracks().length) return s;
+              s.getTracks().forEach((t) => t.stop());
+            } catch (e) {
+              console.warn('loopback capture failed:', id, e && e.message);
+            }
+            try {
+              const s = await tryGum(id, {
+                mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: id }
+              });
+              if (s.getVideoTracks().length) return s;
+              s.getTracks().forEach((t) => t.stop());
+            } catch (e) {
+              console.warn('paired capture failed:', id, e && e.message);
+            }
+          }
+          try {
+            const s = await tryGum(id, false);
+            if (s.getVideoTracks().length) return s;
+            s.getTracks().forEach((t) => t.stop());
+          } catch (e) {
+            console.warn('video-only capture failed:', id, e && e.message);
+          }
+        }
+
+        if (withAudio && navigator.mediaDevices.getDisplayMedia) {
+          try {
+            const display = await Promise.race([
+              navigator.mediaDevices.getDisplayMedia({
+                audio: true,
+                video: {
+                  frameRate: { ideal: fps, max: fps },
+                  width: { max: 2560, ideal: 1920 },
+                  height: { max: 1440, ideal: 1080 }
+                }
+              }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('display timeout')), 4000))
+            ]);
+            if (display.getVideoTracks().length) return display;
+            display.getTracks().forEach((t) => t.stop());
+          } catch (e) {
+            console.warn('getDisplayMedia failed:', e && e.message);
+          }
+        }
+
+        throw new Error('Could not capture the fullscreen game');
+      }
+
+      function sendPcm(buffer) {
+        if (!running || !buffer) return;
+        window.gameCapture.audioChunk(buffer);
+      }
+
+      async function hookPcmTap(mixer) {
+        try {
+          const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+          const url = URL.createObjectURL(blob);
+          await audioCtx.audioWorklet.addModule(url);
+          URL.revokeObjectURL(url);
+          const node = new AudioWorkletNode(audioCtx, 'pcm-capture', {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [2]
+          });
+          node.port.onmessage = (ev) => {
+            if (!ev.data) return;
+            if (typeof ev.data.peak === 'number' && ev.data.peak > audioPeak) {
+              audioPeak = ev.data.peak;
+            }
+            sendPcm(ev.data.pcm);
+          };
+          const mute = audioCtx.createGain();
+          mute.gain.value = 0;
+          mixer.connect(node);
+          node.connect(mute);
+          mute.connect(audioCtx.destination);
+          return true;
+        } catch (e) {
+          console.warn('AudioWorklet unavailable, using ScriptProcessor:', e && e.message);
+        }
+
+        const proc = audioCtx.createScriptProcessor(4096, 2, 2);
+        const mute = audioCtx.createGain();
+        mute.gain.value = 0;
+        proc.onaudioprocess = (ev) => {
+          if (!running) return;
+          const left = ev.inputBuffer.getChannelData(0);
+          const right = ev.inputBuffer.numberOfChannels > 1
+            ? ev.inputBuffer.getChannelData(1)
+            : left;
+          const interleaved = new Int16Array(left.length * 2);
+          let peak = 0;
+          for (let i = 0; i < left.length; i++) {
+            const l = left[i];
+            const r = right[i];
+            const al = Math.abs(l);
+            const ar = Math.abs(r);
+            if (al > peak) peak = al;
+            if (ar > peak) peak = ar;
+            interleaved[i * 2] = Math.max(-32768, Math.min(32767, l * 32767));
+            interleaved[i * 2 + 1] = Math.max(-32768, Math.min(32767, r * 32767));
+          }
+          if (peak > audioPeak) audioPeak = peak;
+          sendPcm(interleaved.buffer.slice(0));
+        };
+        mixer.connect(proc);
+        proc.connect(mute);
+        mute.connect(audioCtx.destination);
+        return true;
+      }
+
+      async function startAudioMix(desktopAudio) {
+        audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+        captureSampleRate = audioCtx.sampleRate || 48000;
+        const resume = async () => {
+          try {
+            if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+          } catch (e) { /* ignore */ }
+        };
+        await resume();
+        keepAliveTimer = setInterval(resume, 1000);
+        audioCtx.onstatechange = resume;
+
+        const mixer = audioCtx.createGain();
+        mixer.gain.value = 1;
+
+        // Silent oscillator keeps the graph alive in a hidden window
+        try {
+          const osc = audioCtx.createOscillator();
+          const oscGain = audioCtx.createGain();
+          oscGain.gain.value = 0.0001;
+          osc.connect(oscGain);
+          oscGain.connect(audioCtx.destination);
+          osc.start();
+        } catch (e) { /* ignore */ }
+
+        if (desktopAudio) {
+          try {
+            desktopAudio.enabled = true;
+            const deskSrc = audioCtx.createMediaStreamSource(new MediaStream([desktopAudio]));
+            const deskGain = audioCtx.createGain();
+            deskGain.gain.value = 1;
+            deskSrc.connect(deskGain);
+            deskGain.connect(mixer);
+            hasLoopback = true;
+          } catch (e) {
+            console.warn('Desktop loopback hook failed:', e && e.message);
+          }
+        }
+
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              channelCount: 1
+            },
+            video: false
+          });
+          const micTrack = micStream.getAudioTracks()[0];
+          if (micTrack) {
+            micTrack.enabled = true;
+            const micSrc = audioCtx.createMediaStreamSource(new MediaStream([micTrack]));
+            micGain = audioCtx.createGain();
+            micGain.gain.value = (!pttEnabled || pttHeld) ? 1 : 0;
+            micSrc.connect(micGain);
+            micGain.connect(mixer);
+            hasMic = true;
+            applyMicGain();
+          }
+        } catch (e) {
+          console.warn('Microphone unavailable:', e && e.message);
+        }
+
+        if (!hasLoopback && !hasMic) return false;
+        await hookPcmTap(mixer);
+        await resume();
+        return true;
+      }
+
+      async function startMediaRecorderPath(videoTrack, width, height) {
+        const types = [
+          'video/webm;codecs=h264,opus',
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm;codecs=vp9',
+          'video/webm;codecs=vp8',
+          'video/webm'
+        ];
+        const mimeType = types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+        const recOpts = { videoBitsPerSecond: bitrate || 6_000_000 };
+        if (mimeType) recOpts.mimeType = mimeType;
+        mediaRecorder = new MediaRecorder(stream, recOpts);
+        mediaRecorder.ondataavailable = async (e) => {
+          if (!e.data || !e.data.size) return;
+          const buf = await e.data.arrayBuffer();
+          window.gameCapture.chunk(buf);
+        };
+        mediaRecorder.onerror = (e) => {
+          if (running) window.gameCapture.failed((e.error && e.error.message) || 'MediaRecorder failed');
+        };
+        mediaRecorder.start(800);
+
+        statsTimer = setInterval(() => {
+          framesIn += 1;
+          window.gameCapture.stats({
+            captureFps: fps,
+            framesEncoded,
+            width,
+            height,
+            pttHeld,
+            audioLive: Boolean(stream.getAudioTracks().length),
+            audioPeak: 0,
+            hasLoopback: Boolean(stream.getAudioTracks().length),
+            hasMic: false
+          });
+        }, 500);
+
+        window.gameCapture.started({
+          mimeType: mediaRecorder.mimeType || 'video/webm',
+          codec: 'mediarecorder',
+          width,
+          height,
+          fps,
+          hardware: false,
+          audio: Boolean(stream.getAudioTracks().length),
+          loopback: Boolean(stream.getAudioTracks().length),
+          mic: false,
+          sampleRate: captureSampleRate,
+          ptt: false
+        });
+      }
+
+      try {
+        stream = await captureDesktopStream();
+        const videoTrack = stream.getVideoTracks()[0];
+        if (!videoTrack) {
+          window.gameCapture.failed('No video track');
+          return;
+        }
+
+        const vs = videoTrack.getSettings ? videoTrack.getSettings() : {};
+        const width = vs.width || 1920;
+        const height = vs.height || 1080;
+        const canWebCodecs = typeof VideoEncoder !== 'undefined' && typeof MediaStreamTrackProcessor !== 'undefined';
+
+        if (!canWebCodecs) {
+          if (mode === 'medal') {
+            window.gameCapture.failed('WECODECS_UNAVAILABLE');
+            return;
+          }
+          await startMediaRecorderPath(videoTrack, width, height);
+          return;
+        }
+
+        encoder = new VideoEncoder({
+          output: (chunk) => {
+            const buf = new ArrayBuffer(chunk.byteLength);
+            chunk.copyTo(buf);
+            framesEncoded += 1;
+            window.gameCapture.videoChunk(buf, chunk.type, chunk.timestamp);
+          },
+          error: (err) => {
+            if (running) window.gameCapture.failed(err.message || String(err));
+          }
+        });
+
+        const candidates = [
+          'avc1.4D401F',
+          'avc1.4D4028',
+          'avc1.64001F',
+          'avc1.42001E'
+        ];
+        let chosen = null;
+        for (const codec of candidates) {
+          const cfg = {
+            codec,
+            width,
+            height,
+            bitrate,
+            framerate: fps,
+            hardwareAcceleration: 'prefer-hardware',
+            latencyMode: 'realtime',
+            avc: { format: 'annexb' }
+          };
+          try {
+            const support = await VideoEncoder.isConfigSupported(cfg);
+            if (support && support.supported) {
+              chosen = support.config || cfg;
+              break;
+            }
+          } catch (e) { /* try next */ }
+        }
+        if (!chosen) {
+          if (mode === 'medal') {
+            window.gameCapture.failed('WECODECS_UNAVAILABLE');
+            return;
+          }
+          await startMediaRecorderPath(videoTrack, width, height);
+          return;
+        }
+        encoder.configure(chosen);
+
+        const desktopAudio = withAudio ? (stream.getAudioTracks()[0] || null) : null;
+        if (withAudio) {
+          let loopbackTrack = desktopAudio;
+          if (!loopbackTrack) {
+            try {
+              const extra = await navigator.mediaDevices.getUserMedia({
+                audio: { mandatory: { chromeMediaSource: 'desktop' } },
+                video: { mandatory: videoFor(screenId || sourceId) }
+              });
+              loopbackTrack = extra.getAudioTracks()[0] || null;
+              extra.getVideoTracks().forEach((t) => t.stop());
+            } catch (e) {
+              console.warn('extra loopback failed:', e && e.message);
+            }
+          }
+          try {
+            await startAudioMix(loopbackTrack);
+          } catch (e) {
+            console.warn('Audio mix failed:', e && e.message);
+          }
+        }
+
+        const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+        const reader = processor.readable.getReader();
+        const keyEvery = Math.max(1, fps);
+
+        statsTimer = setInterval(() => {
+          const now = Date.now();
+          const dt = Math.max(0.2, (now - lastStats) / 1000);
+          const captureFps = framesIn / dt;
+          framesIn = 0;
+          lastStats = now;
+          const peak = audioPeak;
+          audioPeak = audioPeak * 0.35;
+          window.gameCapture.stats({
+            captureFps,
+            framesEncoded,
+            width,
+            height,
+            pttHeld,
+            audioLive: hasLoopback || hasMic,
+            audioPeak: peak,
+            hasLoopback,
+            hasMic
+          });
+        }, 500);
+
+        window.gameCapture.started({
+          mimeType: 'video/mp4',
+          codec: chosen.codec,
+          width,
+          height,
+          fps,
+          hardware: true,
+          audio: hasLoopback || hasMic,
+          loopback: hasLoopback,
+          mic: hasMic,
+          sampleRate: captureSampleRate,
+          ptt: pttEnabled && Boolean(micGain)
+        });
+
+        while (running) {
+          const { value: frame, done } = await reader.read();
+          if (done || !running) {
+            if (frame) frame.close();
+            break;
+          }
+          if (encoder.state !== 'configured') {
+            frame.close();
+            break;
+          }
+          const keyFrame = framesEncoded % keyEvery === 0;
+          try {
+            encoder.encode(frame, { keyFrame });
+            framesIn += 1;
+          } catch (e) {
+            frame.close();
+            throw e;
+          }
+          frame.close();
+        }
+      } catch (err) {
+        running = false;
+        window.gameCapture.failed(err.message || String(err));
+      }
+    })();
+  </script>
+</body>
+</html>
