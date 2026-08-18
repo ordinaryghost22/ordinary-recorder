@@ -9,10 +9,14 @@
     (async () => {
       const params = new URLSearchParams(location.search);
       const sourceId = params.get('sourceId');
-      const fps = Math.min(30, Math.max(15, Number(params.get('fps') || 30)));
+      const fps = Math.min(144, Math.max(15, Number(params.get('fps') || 30)));
       const withAudio = params.get('audio') === '1';
       let pttEnabled = params.get('ptt') === '1';
       const bitrate = Number(params.get('bitrate') || 8_000_000);
+      const codecPref = (params.get('codec') || 'h264').toLowerCase();
+      const preferHw = params.get('hw') !== '0';
+      const maxWidth = Math.max(640, Number(params.get('maxWidth') || 2560) || 2560);
+      const maxHeight = Math.max(360, Number(params.get('maxHeight') || 1440) || 1440);
 
       const screenId = params.get('screenId') || '';
       const sourceIds = [sourceId, screenId].filter((id, i, arr) => id && arr.indexOf(id) === i);
@@ -35,9 +39,14 @@
       let lastStats = Date.now();
       let pttHeld = false;
       let audioPeak = 0;
+      let loopbackPeak = 0;
+      let micPeak = 0;
+      let deskAnalyser = null;
+      let micAnalyser = null;
       let hasLoopback = false;
       let hasMic = false;
       let captureSampleRate = 48000;
+      let mixDest = null;
 
       const WORKLET_SRC = `
         class PcmCapture extends AudioWorkletProcessor {
@@ -110,6 +119,66 @@
         applyMicGain();
       });
 
+      function analyserPeak(analyser) {
+        if (!analyser) return 0;
+        const buf = new Uint8Array(analyser.fftSize);
+        analyser.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = Math.abs(buf[i] - 128) / 128;
+          if (v > peak) peak = v;
+        }
+        return peak;
+      }
+
+      function sampleSourcePeaks() {
+        const lp = analyserPeak(deskAnalyser);
+        const mp = analyserPeak(micAnalyser);
+        if (lp > loopbackPeak) loopbackPeak = lp;
+        if (mp > micPeak) micPeak = mp;
+      }
+
+      function watchTrack(track, kind) {
+        if (!track || typeof track.addEventListener !== 'function') return;
+        track.addEventListener('ended', () => {
+          if (kind === 'loopback') { hasLoopback = false; loopbackPeak = 0; }
+          if (kind === 'mic') { hasMic = false; micPeak = 0; }
+          window.gameCapture.stats({
+            captureFps: 0,
+            framesEncoded: 0,
+            width: 0,
+            height: 0,
+            pttHeld,
+            audioLive: hasLoopback || hasMic,
+            audioPeak,
+            loopbackPeak,
+            micPeak,
+            hasLoopback,
+            hasMic,
+            audioDropped: kind
+          });
+        });
+      }
+
+      function audioStatsFields() {
+        sampleSourcePeaks();
+        const peak = audioPeak;
+        const lp = loopbackPeak;
+        const mp = micPeak;
+        audioPeak *= 0.35;
+        loopbackPeak *= 0.35;
+        micPeak *= 0.35;
+        return {
+          pttHeld,
+          audioLive: hasLoopback || hasMic,
+          audioPeak: peak,
+          loopbackPeak: lp,
+          micPeak: mp,
+          hasLoopback,
+          hasMic
+        };
+      }
+
       const mode = params.get('mode') || 'medal';
       let mediaRecorder = null;
 
@@ -117,13 +186,28 @@
         running = false;
         if (statsTimer) clearInterval(statsTimer);
         if (keepAliveTimer) clearInterval(keepAliveTimer);
-        try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (e) { /* ignore */ }
+        try {
+          if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            await new Promise((resolve) => {
+              const t = setTimeout(resolve, 1500);
+              mediaRecorder.onstop = () => {
+                clearTimeout(t);
+                resolve();
+              };
+              try { mediaRecorder.stop(); } catch (e) {
+                clearTimeout(t);
+                resolve();
+              }
+            });
+          }
+        } catch (e) { /* ignore */ }
         try { if (encoder && encoder.state !== 'closed') await encoder.flush(); } catch (e) { /* ignore */ }
         try { if (encoder && encoder.state !== 'closed') encoder.close(); } catch (e) { /* ignore */ }
         try { if (audioCtx) await audioCtx.close(); } catch (e) { /* ignore */ }
         try { if (stream) stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
         try { if (micStream) micStream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
-        window.gameCapture.stopped();
+        if (mode === 'audio') window.gameCapture.loopbackStopped();
+        else window.gameCapture.stopped();
       };
 
       window.gameCapture.registerStop(stopAll);
@@ -132,8 +216,8 @@
         chromeMediaSource: 'desktop',
         chromeMediaSourceId: id,
         maxFrameRate: fps,
-        maxWidth: 2560,
-        maxHeight: 1440
+        maxWidth,
+        maxHeight
       });
 
       async function captureDesktopStream() {
@@ -177,8 +261,8 @@
                 audio: true,
                 video: {
                   frameRate: { ideal: fps, max: fps },
-                  width: { max: 2560, ideal: 1920 },
-                  height: { max: 1440, ideal: 1080 }
+                  width: { max: maxWidth, ideal: Math.min(1920, maxWidth) },
+                  height: { max: maxHeight, ideal: Math.min(1080, maxHeight) }
                 }
               }),
               new Promise((_, reject) => setTimeout(() => reject(new Error('display timeout')), 4000))
@@ -190,7 +274,7 @@
           }
         }
 
-        throw new Error('Could not capture the fullscreen game');
+        throw new Error('Could not capture the screen');
       }
 
       function sendPcm(buffer) {
@@ -289,7 +373,11 @@
             deskGain.gain.value = 1;
             deskSrc.connect(deskGain);
             deskGain.connect(mixer);
+            deskAnalyser = audioCtx.createAnalyser();
+            deskAnalyser.fftSize = 256;
+            deskGain.connect(deskAnalyser);
             hasLoopback = true;
+            watchTrack(desktopAudio, 'loopback');
           } catch (e) {
             console.warn('Desktop loopback hook failed:', e && e.message);
           }
@@ -313,17 +401,85 @@
             micGain.gain.value = (!pttEnabled || pttHeld) ? 1 : 0;
             micSrc.connect(micGain);
             micGain.connect(mixer);
+            micAnalyser = audioCtx.createAnalyser();
+            micAnalyser.fftSize = 256;
+            micGain.connect(micAnalyser);
             hasMic = true;
             applyMicGain();
+            watchTrack(micTrack, 'mic');
           }
         } catch (e) {
           console.warn('Microphone unavailable:', e && e.message);
         }
 
         if (!hasLoopback && !hasMic) return false;
+        mixDest = audioCtx.createMediaStreamDestination();
+        mixer.connect(mixDest);
         await hookPcmTap(mixer);
         await resume();
         return true;
+      }
+
+      async function startAudioOnlyPath() {
+        try {
+          stream = await captureDesktopStream();
+        } catch (e) {
+          window.gameCapture.loopbackFailed(e.message || String(e));
+          return;
+        }
+        const desktopAudio = stream.getAudioTracks()[0] || null;
+        stream.getVideoTracks().forEach((t) => { t.enabled = false; });
+        let ok = false;
+        try {
+          ok = await startAudioMix(desktopAudio);
+        } catch (e) {
+          window.gameCapture.loopbackFailed(e.message || String(e));
+          return;
+        }
+        if (!ok || !mixDest || !mixDest.stream.getAudioTracks().length) {
+          window.gameCapture.loopbackFailed('Could not capture desktop audio');
+          return;
+        }
+
+        const types = ['audio/webm;codecs=opus', 'audio/webm'];
+        const mimeType = types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+        const recOpts = { audioBitsPerSecond: 192000 };
+        if (mimeType) recOpts.mimeType = mimeType;
+        mediaRecorder = new MediaRecorder(mixDest.stream, recOpts);
+        mediaRecorder.ondataavailable = async (e) => {
+          if (!e.data || !e.data.size) return;
+          const buf = await e.data.arrayBuffer();
+          window.gameCapture.audioFileChunk(buf);
+        };
+        mediaRecorder.onerror = (e) => {
+          if (running) window.gameCapture.loopbackFailed((e.error && e.error.message) || 'Audio recorder failed');
+        };
+        mediaRecorder.start(400);
+
+        statsTimer = setInterval(() => {
+          window.gameCapture.stats({
+            captureFps: 0,
+            framesEncoded: 0,
+            width: 0,
+            height: 0,
+            ...audioStatsFields()
+          });
+        }, 500);
+
+        window.gameCapture.onLoopbackControl((action) => {
+          try {
+            if (action === 'pause' && mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.pause();
+            if (action === 'resume' && mediaRecorder && mediaRecorder.state === 'paused') mediaRecorder.resume();
+          } catch (e) { /* ignore */ }
+        });
+
+        window.gameCapture.loopbackStarted({
+          mimeType: mediaRecorder.mimeType || 'audio/webm',
+          audio: true,
+          loopback: hasLoopback,
+          mic: hasMic,
+          sampleRate: captureSampleRate
+        });
       }
 
       async function startMediaRecorderPath(videoTrack, width, height) {
@@ -356,11 +512,9 @@
             framesEncoded,
             width,
             height,
-            pttHeld,
-            audioLive: Boolean(stream.getAudioTracks().length),
-            audioPeak: 0,
-            hasLoopback: Boolean(stream.getAudioTracks().length),
-            hasMic: false
+            ...audioStatsFields(),
+            audioLive: hasLoopback || hasMic || Boolean(stream.getAudioTracks().length),
+            hasLoopback: hasLoopback || Boolean(stream.getAudioTracks().length)
           });
         }, 500);
 
@@ -377,6 +531,11 @@
           sampleRate: captureSampleRate,
           ptt: false
         });
+      }
+
+      if (mode === 'audio') {
+        await startAudioOnlyPath();
+        return;
       }
 
       try {
@@ -413,12 +572,20 @@
           }
         });
 
-        const candidates = [
+        const candidates = [];
+        const hwPref = preferHw ? 'prefer-hardware' : 'prefer-software';
+        if (codecPref === 'av1') {
+          candidates.push('av01.0.08M.08', 'av01.0.04M.08', 'av01.0.0CM.08');
+        }
+        if (codecPref === 'hevc' || codecPref === 'av1') {
+          candidates.push('hvc1.1.6.L93.B0', 'hev1.1.6.L93.B0', 'hvc1.1.6.L120.B0');
+        }
+        candidates.push(
           'avc1.4D401F',
           'avc1.4D4028',
           'avc1.64001F',
           'avc1.42001E'
-        ];
+        );
         let chosen = null;
         for (const codec of candidates) {
           const cfg = {
@@ -427,10 +594,11 @@
             height,
             bitrate,
             framerate: fps,
-            hardwareAcceleration: 'prefer-hardware',
-            latencyMode: 'realtime',
-            avc: { format: 'annexb' }
+            hardwareAcceleration: hwPref,
+            latencyMode: 'realtime'
           };
+          if (/^avc1/i.test(codec)) cfg.avc = { format: 'annexb' };
+          if (/^hvc1|^hev1/i.test(codec)) cfg.hevc = { format: 'annexb' };
           try {
             const support = await VideoEncoder.isConfigSupported(cfg);
             if (support && support.supported) {
@@ -481,18 +649,12 @@
           const captureFps = framesIn / dt;
           framesIn = 0;
           lastStats = now;
-          const peak = audioPeak;
-          audioPeak = audioPeak * 0.35;
           window.gameCapture.stats({
             captureFps,
             framesEncoded,
             width,
             height,
-            pttHeld,
-            audioLive: hasLoopback || hasMic,
-            audioPeak: peak,
-            hasLoopback,
-            hasMic
+            ...audioStatsFields()
           });
         }, 500);
 
@@ -502,7 +664,7 @@
           width,
           height,
           fps,
-          hardware: true,
+          hardware: preferHw,
           audio: hasLoopback || hasMic,
           loopback: hasLoopback,
           mic: hasMic,

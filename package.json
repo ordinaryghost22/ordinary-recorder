@@ -1,6 +1,6 @@
 {
   "name": "ordinary-recorder",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Lightweight 60fps screen recorder using AMD hardware encoding",
   "main": "main.js",
   "scripts": {

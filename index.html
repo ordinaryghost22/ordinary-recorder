@@ -6,6 +6,28 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div class="wizard" id="hwWizard" hidden>
+    <div class="wizard-card">
+      <div class="wizard-kicker">First-run setup</div>
+      <h1 class="wizard-title">Hardware profile</h1>
+      <p class="wizard-lead" id="wizardLead">Detecting GPU, RAM, and CPU so recordings stay smooth on this PC.</p>
+      <div class="wizard-stats" id="wizardStats">
+        <div class="wizard-stat"><span>GPU</span><strong id="wizardGpu">…</strong></div>
+        <div class="wizard-stat"><span>VRAM</span><strong id="wizardVram">…</strong></div>
+        <div class="wizard-stat"><span>RAM</span><strong id="wizardRam">…</strong></div>
+        <div class="wizard-stat"><span>CPU</span><strong id="wizardCpu">…</strong></div>
+      </div>
+      <div class="wizard-tier" id="wizardTierWrap" hidden>
+        <div class="wizard-tier-label">Detected tier</div>
+        <div class="wizard-tier-value" id="wizardTier">Mid</div>
+        <p class="wizard-defaults" id="wizardDefaults"></p>
+      </div>
+      <div class="wizard-actions">
+        <button type="button" class="btn-primary" id="wizardAccept" disabled>Use these defaults</button>
+        <button type="button" class="btn-secondary" id="wizardCustomize" disabled>Customize in Settings</button>
+      </div>
+    </div>
+  </div>
   <div class="app" id="appRoot">
     <aside class="sidebar">
       <div class="brand">
@@ -46,13 +68,18 @@
 
     <main class="main">
       <div class="main-inner">
+          <div class="app-toast" id="appNotice" hidden></div>
+          <div class="disk-banner" id="diskBanner" hidden>
+            <strong>Disk space is getting low.</strong>
+            <span id="diskBannerText">Recording will stop automatically if the drive fills up.</span>
+          </div>
 
         <!-- Recorder -->
         <section class="view" data-view="recorder">
           <header class="page-header">
             <div>
               <h1 class="page-title">Recorder</h1>
-              <p class="page-desc">Record your gameplay in high quality.</p>
+              <p class="page-desc">Record the whole desktop — every game and every app.</p>
             </div>
             <button type="button" class="btn-quiet hotkey-reset" id="hotkeyReset">Reset Defaults</button>
           </header>
@@ -80,6 +107,17 @@
                       <span class="stats-sep" id="audioSep" hidden></span>
                     </div>
                     <div class="rec-meter-label">Capture</div>
+                  </div>
+                  <div class="rec-meter rec-meter-levels" id="audioMeters" hidden>
+                    <div class="level-row">
+                      <span>Game</span>
+                      <span class="level-track"><span class="level-fill" id="gameLevelFill"></span></span>
+                    </div>
+                    <div class="level-row">
+                      <span>Mic</span>
+                      <span class="level-track"><span class="level-fill" id="micLevelFill"></span></span>
+                    </div>
+                    <div class="rec-meter-label">Levels</div>
                   </div>
                 </div>
                 <div class="buffer-bar" id="replayIndicator" hidden>
@@ -123,12 +161,17 @@
                 <span class="shortcut-keys"></span>
                 <span class="esc-hint">Esc to cancel</span>
               </button>
+              <button type="button" class="shortcut-card hotkey-btn" id="hotkeyBookmark" data-bind="bookmarkHotkey">
+                <span class="shortcut-label">Bookmark</span>
+                <span class="shortcut-keys"></span>
+                <span class="esc-hint">Esc to cancel</span>
+              </button>
             </div>
           </section>
 
           <section class="section">
             <h2 class="section-title">Live Recording</h2>
-            <p class="section-desc">Used when you press Start Recording or Ctrl+Shift+R.</p>
+            <p class="section-desc">Captures your full screen. If a game is exclusive fullscreen, press the hotkey while that game is in front.</p>
             <div class="settings-surface">
               <div class="setting-row">
                 <div class="row-copy">
@@ -161,7 +204,7 @@
               <label class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Game Audio</div>
-                  <div class="row-desc">Capture system and in-game sound</div>
+                  <div class="row-desc">Record what you hear on speakers or headphones</div>
                 </div>
                 <input type="checkbox" id="recordAudio" class="switch-input" checked>
                 <span class="switch"></span>
@@ -169,7 +212,7 @@
               <label class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Smaller Files</div>
-                  <div class="row-desc">Prefer a more efficient encode</div>
+                  <div class="row-desc" id="spaceSavingDesc">Lower H.264 bitrate. H.265 in Settings is the real space saver when your GPU supports it.</div>
                 </div>
                 <input type="checkbox" id="spaceSaving" class="switch-input" checked>
                 <span class="switch"></span>
@@ -200,7 +243,7 @@
               <div class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Buffer Length</div>
-                  <div class="row-desc">How much gameplay to keep rolling</div>
+                  <div class="row-desc" id="replayRamHint">How much gameplay to keep rolling</div>
                 </div>
                 <div class="select-wrap">
                   <select id="replayBufferSelect" tabindex="-1" aria-hidden="true">
@@ -301,6 +344,34 @@
           </div>
 
           <div class="clips-list" id="clipsList"></div>
+
+          <div class="trim-panel" id="trimPanel" hidden>
+            <h2 class="section-title">Trim clip</h2>
+            <p class="section-desc" id="trimFileName">Select a recording, then set start and end.</p>
+            <video id="trimVideo" class="trim-video" controls playsinline></video>
+            <div class="trim-times">
+              <label class="trim-field">Start
+                <input type="range" id="trimStart" min="0" max="1" step="0.05" value="0">
+                <span id="trimStartLabel">0:00</span>
+              </label>
+              <label class="trim-field">End
+                <input type="range" id="trimEnd" min="0" max="1" step="0.05" value="1">
+                <span id="trimEndLabel">0:00</span>
+              </label>
+            </div>
+            <label class="setting-row trim-precise">
+              <div class="row-copy">
+                <div class="row-label">Frame-accurate</div>
+                <div class="row-desc">Re-encodes for exact cuts. Off uses a fast keyframe stream copy.</div>
+              </div>
+              <input type="checkbox" id="trimPrecise" class="switch-input">
+              <span class="switch"></span>
+            </label>
+            <div class="library-actions">
+              <button type="button" class="btn-quiet" id="trimCancel">Close</button>
+              <button type="button" class="btn-primary" id="trimExport">Export Trimmed Clip</button>
+            </div>
+          </div>
         </section>
 
         <!-- Hotkeys -->
@@ -340,6 +411,14 @@
               </div>
               <span class="hotkey-keys shortcut-keys"></span>
             </button>
+            <button type="button" class="setting-row hotkey-btn" data-bind="bookmarkHotkey">
+              <div class="row-copy">
+                <div class="row-label">Bookmark moment</div>
+                <div class="row-desc">Mark a timestamp in the rolling buffer without saving a clip</div>
+                <span class="esc-hint">Esc to cancel</span>
+              </div>
+              <span class="hotkey-keys shortcut-keys"></span>
+            </button>
           </div>
         </section>
 
@@ -354,7 +433,7 @@
 
           <section class="section">
             <h2 class="section-title">Capture</h2>
-            <p class="section-desc">These apply to live recordings and Instant Replay.</p>
+            <p class="section-desc">By default the whole desktop is recorded — games, browsers, and any software.</p>
             <div class="settings-surface">
               <div class="setting-row">
                 <div class="row-copy">
@@ -365,6 +444,7 @@
                   <select id="fpsSelect" tabindex="-1" aria-hidden="true">
                     <option value="30" selected>30 fps</option>
                     <option value="60">60 fps</option>
+                    <option value="144">144 fps</option>
                   </select>
                   <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
                     <span class="select-value">30 fps</span>
@@ -373,13 +453,83 @@
                   <div class="select-menu" hidden role="listbox">
                     <button type="button" class="select-option" role="option" data-value="30">30 fps</button>
                     <button type="button" class="select-option" role="option" data-value="60">60 fps</button>
+                    <button type="button" class="select-option" role="option" data-value="144">144 fps</button>
                   </div>
                 </div>
               </div>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Output Resolution</div>
+                  <div class="row-desc">Scale the recording. Native keeps your desktop size</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="resolutionSelect" tabindex="-1" aria-hidden="true">
+                    <option value="native" selected>Native</option>
+                    <option value="1440">1440p</option>
+                    <option value="1080">1080p</option>
+                    <option value="720">720p</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">Native</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="native">Native</option>
+                    <button type="button" class="select-option" role="option" data-value="1440">1440p</button>
+                    <button type="button" class="select-option" role="option" data-value="1080">1080p</button>
+                    <button type="button" class="select-option" role="option" data-value="720">720p</button>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Hardware Encoder</div>
+                  <div class="row-desc" id="encoderHint">Auto-detect NVIDIA NVENC, AMD AMF, or Intel Quick Sync</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="encoderSelect" tabindex="-1" aria-hidden="true">
+                    <option value="auto" selected>Auto</option>
+                    <option value="nvenc">NVIDIA NVENC</option>
+                    <option value="amf">AMD AMF</option>
+                    <option value="qsv">Intel Quick Sync</option>
+                    <option value="x264">Software (x264)</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">Auto</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="auto">Auto</button>
+                    <button type="button" class="select-option" role="option" data-value="nvenc">NVIDIA NVENC</button>
+                    <button type="button" class="select-option" role="option" data-value="amf">AMD AMF</button>
+                    <button type="button" class="select-option" role="option" data-value="qsv">Intel Quick Sync</button>
+                    <button type="button" class="select-option" role="option" data-value="x264">Software (x264)</button>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Video Codec</div>
+                  <div class="row-desc" id="codecHint">H.264 is the default. H.265 is smaller on supported GPUs</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="codecSelect" tabindex="-1" aria-hidden="true">
+                    <option value="h264" selected>H.264</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">H.264</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="h264">H.264</button>
+                  </div>
+                </div>
+              </div>
+              <p class="replay-note" id="codecSizeHint">Estimated size is shown after hardware detection.</p>
               <label class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Game Capture</div>
-                  <div class="row-desc">Optimize encode for gameplay</div>
+                  <div class="row-desc">Sharper encode for games. Desktop recording still captures every app</div>
                 </div>
                 <input type="checkbox" id="gameModeToggle" class="switch-input" checked>
                 <span class="switch"></span>
@@ -387,11 +537,44 @@
               <label class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Exclusive Fullscreen</div>
-                  <div class="row-desc">On if the game is exclusive fullscreen. Borderless is more reliable</div>
+                  <div class="row-desc">On to also capture games that take over the whole screen. Off always records the desktop</div>
                 </div>
                 <input type="checkbox" id="exclusiveFullscreenToggle" class="switch-input" checked>
                 <span class="switch"></span>
               </label>
+              <div class="setting-row">
+                <div class="row-copy">
+                  <div class="row-label">Disk Reserve</div>
+                  <div class="row-desc">Stop recording before the drive fills up (default 500 MB)</div>
+                </div>
+                <div class="select-wrap">
+                  <select id="diskSpaceSelect" tabindex="-1" aria-hidden="true">
+                    <option value="250">250 MB</option>
+                    <option value="500" selected>500 MB</option>
+                    <option value="1024">1 GB</option>
+                    <option value="2048">2 GB</option>
+                  </select>
+                  <button type="button" class="select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="select-value">500 MB</span>
+                    <svg class="select-chevron" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                  <div class="select-menu" hidden role="listbox">
+                    <button type="button" class="select-option" role="option" data-value="250">250 MB</button>
+                    <button type="button" class="select-option" role="option" data-value="500">500 MB</button>
+                    <button type="button" class="select-option" role="option" data-value="1024">1 GB</button>
+                    <button type="button" class="select-option" role="option" data-value="2048">2 GB</button>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-row setting-row-stack">
+                <div class="row-copy">
+                  <div class="row-label">Capture fallbacks</div>
+                  <div class="row-desc">Games that skip Desktop Duplication and go straight to game capture. Remove one to retry the desktop path after a driver update.</div>
+                </div>
+                <div class="fallback-list" id="unstableGamesList">
+                  <p class="fallback-empty" id="unstableGamesEmpty">None yet — games are added automatically if Desktop Duplication fails.</p>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -402,7 +585,7 @@
               <div class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Audio Source</div>
-                  <div class="row-desc">Game audio needs Stereo Mix or VB-Cable</div>
+                  <div class="row-desc">Desktop sound is captured from what you hear</div>
                 </div>
                 <div class="select-wrap">
                   <select id="audioSourceSelect" tabindex="-1" aria-hidden="true">
@@ -422,7 +605,7 @@
               <div class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Audio Device</div>
-                  <div class="row-desc">CABLE Output or Stereo Mix for game sound</div>
+                  <div class="row-desc">Fallback only. WASAPI loopback is used when it works</div>
                 </div>
                 <div class="select-wrap">
                   <select id="audioDeviceSelect" tabindex="-1" aria-hidden="true">
@@ -438,7 +621,13 @@
                 </div>
               </div>
             </div>
-            <p class="replay-note" id="audioHint">If game sound is missing, install VB-Audio Cable or enable Stereo Mix.</p>
+            <div class="audio-diag" id="audioDiag" hidden></div>
+            <div class="audio-test-row">
+              <button type="button" class="btn-secondary" id="testAudioBtn">Test Audio</button>
+              <span class="replay-note" id="testAudioStatus">Records 3 seconds of game audio + mic and plays it back.</span>
+            </div>
+            <audio id="testAudioPlayer" controls hidden></audio>
+            <p class="replay-note" id="audioHint">Desktop sound is recorded from your speakers or headphones. Keep Game Audio on.</p>
           </section>
 
           <section class="section">

@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('recorder', {
   getSettings: () => ipcRenderer.invoke('get-settings'),
   saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+  getHardware: () => ipcRenderer.invoke('get-hardware'),
+  completeWizard: (payload) => ipcRenderer.invoke('complete-wizard', payload),
   listAudioDevices: () => ipcRenderer.invoke('list-audio-devices'),
   start: () => ipcRenderer.invoke('start-recording'),
   stop: () => ipcRenderer.invoke('stop-recording'),
@@ -17,7 +19,14 @@ contextBridge.exposeInMainWorld('recorder', {
   listRecordings: () => ipcRenderer.invoke('list-recordings'),
   openRecording: (filePath) => ipcRenderer.invoke('open-recording', filePath),
   showRecording: (filePath) => ipcRenderer.invoke('show-recording', filePath),
+  probeRecording: (filePath) => ipcRenderer.invoke('probe-recording', filePath),
+  trimRecording: (opts) => ipcRenderer.invoke('trim-recording', opts),
   onStateChange: (callback) => ipcRenderer.on('recording-state', (_event, data) => callback(data)),
   onReplayStateChange: (callback) => ipcRenderer.on('instant-replay-state', (_event, data) => callback(data)),
+  onHardwareReady: (callback) => ipcRenderer.on('hardware-ready', (_event, data) => callback(data)),
+  onNotice: (callback) => ipcRenderer.on('app-notice', (_event, data) => callback(data)),
+  forgetUnstableGame: (id) => ipcRenderer.invoke('forget-unstable-game', id),
+  testAudio: () => ipcRenderer.invoke('test-audio'),
+  markReplayBookmark: () => ipcRenderer.invoke('mark-replay-bookmark'),
   setHotkeyCapture: (enable) => ipcRenderer.invoke('set-hotkey-capture', enable)
 });

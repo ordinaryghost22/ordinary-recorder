@@ -2,6 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, dialog, shell, 
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { pathToFileURL } = require('url');
 const { spawn, spawnSync, execSync } = require('child_process');
 
 // Only one instance — many copies steal hotkeys and break recording
@@ -32,10 +33,10 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('enable-usermedia-screen-capturing');
 app.commandLine.appendSwitch('enable-experimental-web-platform-features');
-app.commandLine.appendSwitch(
-  'enable-features',
+app.commandLine.appendSwitch('enable-features',
   'WebRtcAllowWgcScreenCapturer,WebRtcAllowWgcWindowCapturer,AllowWgcScreenCapturer,AllowWgcWindowCapturer,WebCodecs'
 );
+app.commandLine.appendSwitch('allow-file-access-from-files');
 
 let mainWindow = null;
 let tray = null;
@@ -70,6 +71,11 @@ let gameCaptureDone = null;
 let gameCaptureMime = 'video/webm';
 let lastGameSourceId = null;
 let webCodecsUnavailable = false;
+let loopbackWin = null;
+let loopbackStream = null;
+let loopbackFile = null;
+let loopbackBytes = 0;
+let loopbackReady = false;
 
 /** Medal-style rolling buffer (encoded H264 + PCM loopback). */
 const medal = {
@@ -87,13 +93,23 @@ const medal = {
   hasLoopback: false,
   hasMic: false,
   sourceId: null,
-  sourceName: null
+  sourceName: null,
+  rawFormat: 'h264',
+  workFile: null,
+  partialVideo: null,
+  partialAudio: null,
+  partialMeta: null,
+  partialFdV: null,
+  partialFdA: null
 };
 
 let powerSaveId = null;
 let lastAudioPeak = 0;
 let gameWatchTimer = null;
+let desktopGameWatchTimer = null;
 let retargetingCapture = false;
+let switchingToGame = false;
+let recordingHandoff = null;
 
 /** Probed once at startup — used to pick capture/encoder paths and warn the user. */
 let ffmpegCaps = {
@@ -101,7 +117,31 @@ let ffmpegCaps = {
   available: false,
   hasDdagrab: false,
   hasH264Amf: false,
-  hasHevcAmf: false
+  hasHevcAmf: false,
+  hasAv1Amf: false,
+  hasH264Nvenc: false,
+  hasHevcNvenc: false,
+  hasAv1Nvenc: false,
+  hasH264Qsv: false,
+  hasHevcQsv: false,
+  hasAv1Qsv: false,
+  hasWasapi: false
+};
+
+/** GPU / RAM / CPU snapshot + the encoder that was actually selected. */
+let hardwareInfo = {
+  ready: false,
+  gpus: [],
+  vendor: 'unknown',
+  gpuName: 'Unknown GPU',
+  vramBytes: 0,
+  ramBytes: os.totalmem(),
+  cpuCores: Math.max(1, os.cpus().length),
+  cpuModel: (os.cpus()[0] && os.cpus()[0].model) || 'CPU',
+  discrete: false,
+  tier: 'mid',
+  encoder: null,
+  reason: 'Not probed yet'
 };
 
 // ---------- Settings (persisted to a plain JSON file next to the exe) ----------
@@ -109,7 +149,7 @@ const settingsPath = path.join(app.getPath('userData'), 'settings.json');
 
 const REPLAY_SEGMENT_SECONDS = 10;
 
-const SETTINGS_VERSION = 8;
+const SETTINGS_VERSION = 11;
 
 const defaultSettings = {
   settingsVersion: SETTINGS_VERSION,
@@ -118,6 +158,9 @@ const defaultSettings = {
   exclusiveFullscreen: true,
   spaceSaving: true,
   amfRateControl: 'vbr_peak',
+  encoder: 'auto',
+  videoCodec: 'h264',
+  outputResolution: 'native',
   audioSource: 'system',
   recordAudio: true,
   audioDevice: null,
@@ -128,10 +171,15 @@ const defaultSettings = {
   hotkey: 'CommandOrControl+Shift+R',
   pauseHotkey: 'CommandOrControl+Shift+P',
   replayHotkey: 'CommandOrControl+Shift+I',
+  bookmarkHotkey: 'CommandOrControl+Shift+B',
   instantReplayEnabled: true,
   instantReplayMinutes: 5,
   instantReplaySaveMinutes: 2,
-  instantReplayFps: 30
+  instantReplayFps: 30,
+  wizardCompleted: false,
+  hardwareProfile: null,
+  diskSpaceLimitMb: 500,
+  knownUnstableGames: []
 };
 
 function loadSettings() {
@@ -164,12 +212,37 @@ function loadSettings() {
         loaded.exclusiveFullscreen = true;
         migrated = true;
       }
+      if (!Number.isFinite(ver) || ver < 9) {
+        // Existing installs already finished first-run; only brand-new profiles see the wizard
+        loaded.wizardCompleted = true;
+        loaded.encoder = loaded.encoder || 'auto';
+        loaded.videoCodec = loaded.videoCodec === 'hevc' || loaded.videoCodec === 'av1' ? loaded.videoCodec : 'h264';
+        loaded.outputResolution = ['native', '1440', '1080', '720'].includes(loaded.outputResolution)
+          ? loaded.outputResolution
+          : 'native';
+        migrated = true;
+      }
+      if (!Number.isFinite(ver) || ver < 10) {
+        loaded.diskSpaceLimitMb = Number(loaded.diskSpaceLimitMb) > 0 ? Number(loaded.diskSpaceLimitMb) : 500;
+        loaded.knownUnstableGames = Array.isArray(loaded.knownUnstableGames) ? loaded.knownUnstableGames : [];
+        migrated = true;
+      }
+      if (!Number.isFinite(ver) || ver < 11) {
+        loaded.bookmarkHotkey = loaded.bookmarkHotkey || 'CommandOrControl+Shift+B';
+        migrated = true;
+      }
       if (migrated) loaded.settingsVersion = SETTINGS_VERSION;
+      loaded.encoder = ['auto', 'nvenc', 'amf', 'qsv', 'x264'].includes(loaded.encoder) ? loaded.encoder : 'auto';
+      loaded.videoCodec = ['h264', 'hevc', 'av1'].includes(loaded.videoCodec) ? loaded.videoCodec : 'h264';
+      loaded.outputResolution = ['native', '1440', '1080', '720'].includes(loaded.outputResolution)
+        ? loaded.outputResolution
+        : 'native';
+      loaded.wizardCompleted = loaded.wizardCompleted === true;
       loaded.instantReplayMinutes = Math.min(5, Math.max(1, Number(loaded.instantReplayMinutes) || 5));
       const saveOpts = [0.5, 1, 2, 3, 4, 5];
       const saveMin = Number(loaded.instantReplaySaveMinutes);
       loaded.instantReplaySaveMinutes = saveOpts.includes(saveMin) ? saveMin : 2;
-      const fpsOpts = [15, 30, 60];
+      const fpsOpts = [15, 30, 60, 144];
       loaded.instantReplayFps = fpsOpts.includes(Number(loaded.instantReplayFps))
         ? Number(loaded.instantReplayFps)
         : 30;
@@ -179,9 +252,13 @@ function loadSettings() {
       loaded.audioSource = loaded.audioSource === 'mic' ? 'mic' : 'system';
       loaded.pttEnabled = loaded.pttEnabled === true;
       loaded.pttKey = PTT_KEYS[loaded.pttKey] ? loaded.pttKey : 'V';
+      loaded.fps = [30, 60, 144].includes(Number(loaded.fps)) ? Number(loaded.fps) : 30;
+      loaded.diskSpaceLimitMb = Math.min(4096, Math.max(200, Number(loaded.diskSpaceLimitMb) || 500));
+      loaded.knownUnstableGames = sanitizeKnownGames(loaded.knownUnstableGames);
       loaded.hotkey = sanitizeAccelerator(loaded.hotkey, defaultSettings.hotkey);
       loaded.pauseHotkey = sanitizeAccelerator(loaded.pauseHotkey, defaultSettings.pauseHotkey);
       loaded.replayHotkey = sanitizeAccelerator(loaded.replayHotkey, defaultSettings.replayHotkey);
+      loaded.bookmarkHotkey = sanitizeAccelerator(loaded.bookmarkHotkey, defaultSettings.bookmarkHotkey);
       if (migrated) {
         try { fs.writeFileSync(settingsPath, JSON.stringify(loaded, null, 2)); } catch (e) { /* ignore */ }
       }
@@ -249,6 +326,31 @@ let liveCaptureFps = null;
 let frameDropHits = 0;
 let borderlessWarnShown = false;
 let lastFpsUiAt = 0;
+let lastDiskFreeBytes = null;
+let lastDiskWarning = null;
+let lastAppNotice = null;
+let diskPollTimer = null;
+let diskStopInFlight = false;
+let medalSpillAt = 0;
+let quittingClean = false;
+let lastLoopbackPeak = 0;
+let lastMicPeak = 0;
+let audioWatchTimer = null;
+let lastAudioDeviceSnapshot = '';
+let audioSwitchInFlight = false;
+let replayBookmarks = [];
+let lastReplaySave = { ok: null, at: 0, error: null, file: null };
+let audioProbe = {
+  devices: [],
+  wasapiListed: false,
+  wasapiWorks: null,
+  stereoMix: null,
+  virtualCable: null,
+  loopbackKind: 'none',
+  hint: '',
+  warning: false,
+  at: 0
+};
 
 // ---------- FFmpeg location ----------
 function ffmpegCandidatePaths() {
@@ -423,6 +525,11 @@ function isMicrophoneDevice(name) {
   return /microphone|mic\b|headset.*mic|array/i.test(name || '');
 }
 
+function pickMicrophoneDevice(devices) {
+  const list = Array.isArray(devices) && devices.length ? devices : listDshowAudioDevices();
+  return list.find((d) => isMicrophoneDevice(d)) || null;
+}
+
 function pickPreferredAudioDevice(devices, source = 'system') {
   if (!devices.length) return null;
 
@@ -468,22 +575,227 @@ function resolveAudioDevice(devices) {
   return pickPreferredAudioDevice(devices, source);
 }
 
-function getAudioSetupHint(devices) {
-  const hasSystem = devices.some((d) => isSystemAudioDevice(d) || /cable output|stereo mix|vb-audio|virtual-audio/i.test(d));
-  if (hasSystem) {
-    return 'Game audio: select “CABLE Output”. In Windows sound, set the game/default output to “CABLE Input” (or enable Stereo Mix).';
+function classifyAudioDevice(name) {
+  const n = String(name || '');
+  if (/cable output|vb-audio|virtual-audio-capturer/i.test(n)) return 'vb-cable';
+  if (/stereo mix|what u hear|wave out mix/i.test(n)) return 'stereo-mix';
+  if (isMicrophoneDevice(n)) return 'mic';
+  return 'other';
+}
+
+function probeWasapiLoopback() {
+  if (!ffmpegCaps.available || !ffmpegCaps.hasWasapi) return false;
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) return false;
+  try {
+    runFfmpegArgv(ffmpegPath, [
+      '-hide_banner', '-nostdin', '-loglevel', 'error',
+      '-f', 'wasapi', '-i', 'loopback',
+      '-t', '0.3', '-f', 'null', '-'
+    ], 8000);
+    return true;
+  } catch (e) {
+    const err = `${e.stderr || ''}${e.stdout || ''}${e.message || ''}`;
+    if (/IAudioClient|Unknown input format|Could not find|not found|No such device/i.test(err) && !/frame=\s*[1-9]/i.test(err)) {
+      return false;
+    }
+    if (/frame=\s*[1-9]|size=\s*[1-9]/i.test(err)) return true;
+    console.warn('WASAPI loopback probe failed:', err.slice(0, 240));
+    return false;
   }
-  return 'No system-audio device found. Enable Stereo Mix in Sound settings, or install VB-Audio Cable to record game audio.';
+}
+
+function refreshAudioProbe({ testWasapi = false } = {}) {
+  const devices = ffmpegCaps.available ? listDshowAudioDevices() : [];
+  const stereoMix = devices.find((d) => classifyAudioDevice(d) === 'stereo-mix') || null;
+  const virtualCable = devices.find((d) => classifyAudioDevice(d) === 'vb-cable') || null;
+  const wasapiListed = Boolean(ffmpegCaps.hasWasapi);
+  if (testWasapi || audioProbe.wasapiWorks == null) {
+    audioProbe.wasapiWorks = probeWasapiLoopback();
+  }
+  let loopbackKind = 'none';
+  if (audioProbe.wasapiWorks) loopbackKind = 'wasapi';
+  else if (virtualCable) loopbackKind = 'vb-cable';
+  else if (stereoMix) loopbackKind = 'stereo-mix';
+  const warning = settings.recordAudio && settings.audioSource !== 'mic' && loopbackKind === 'none';
+  let hint;
+  if (!settings.recordAudio) {
+    hint = 'Game audio is off. Turn it on in Settings if you want what you hear in the recording.';
+  } else if (settings.audioSource === 'mic') {
+    hint = 'Microphone only. Game audio is not captured.';
+  } else if (loopbackKind === 'wasapi') {
+    hint = 'WASAPI loopback is working — game audio is captured from your speakers/headphones. Stereo Mix or a virtual cable is not needed.';
+  } else if (loopbackKind === 'vb-cable') {
+    hint = `Using virtual cable (${virtualCable}). WASAPI loopback is not available in this FFmpeg build.`;
+  } else if (loopbackKind === 'stereo-mix') {
+    hint = `Using Stereo Mix (${stereoMix}). WASAPI loopback is not available — enable it in Windows sound settings if this is silent.`;
+  } else {
+    hint = 'No usable game-audio loopback. WASAPI is missing, Stereo Mix is disabled, and no VB-CABLE device was found. Recordings may have no game sound until one of those is available.';
+  }
+  audioProbe = {
+    devices,
+    wasapiListed,
+    wasapiWorks: Boolean(audioProbe.wasapiWorks),
+    stereoMix,
+    virtualCable,
+    loopbackKind,
+    hint,
+    warning,
+    preferred: resolveAudioDevice(devices),
+    at: Date.now()
+  };
+  return audioProbe;
+}
+
+function getAudioSetupHint(devices) {
+  if (!audioProbe.at || devices) {
+    if (devices && (!audioProbe.devices || audioProbe.devices.join('|') !== devices.join('|'))) {
+      audioProbe.devices = devices.slice();
+    }
+    refreshAudioProbe({ testWasapi: audioProbe.wasapiWorks == null });
+  }
+  return audioProbe.hint;
+}
+
+function describeAudioRoute() {
+  const p = audioProbe.at ? audioProbe : refreshAudioProbe();
+  const parts = [
+    `kind=${p.loopbackKind}`,
+    `wasapi listed/works=${p.wasapiListed}/${p.wasapiWorks}`,
+    `stereo mix=${p.stereoMix || '(none)'}`,
+    `virtual cable=${p.virtualCable || '(none)'}`,
+    `device=${settings.audioDevice || '(auto)'}`,
+    `source=${settings.audioSource}`
+  ];
+  return parts.join('  ');
+}
+
+function audioDeviceSnapshot(devices) {
+  return (devices || []).slice().sort().join('|');
+}
+
+function applyAudioDeviceChange(reason, nextDevice) {
+  if (!session || audioSwitchInFlight) return false;
+  audioSwitchInFlight = true;
+  try {
+    appendDiagnosticsLine(`Audio: ${reason}${nextDevice ? ` → ${nextDevice}` : ' (dropped)'}`);
+    if (nextDevice) {
+      session.audioDevice = nextDevice;
+      session.audioDropped = false;
+      settings.audioDevice = nextDevice;
+      saveSettings(settings);
+      notifyUser(`Audio device changed — now using ${nextDevice}`);
+    } else {
+      session.audioDevice = null;
+      session.micDevice = null;
+      session.audioDropped = true;
+      session.audioOpened = false;
+      notifyUser('Audio source dropped — recording continues without that device');
+    }
+    restartCurrentSegment();
+    return true;
+  } finally {
+    setTimeout(() => { audioSwitchInFlight = false; }, 1500);
+  }
+}
+
+function checkAudioDeviceGuard() {
+  if (!isRecording && !usingGameCapture && !medal.active && !loopbackReady) return;
+  if (isPaused || audioSwitchInFlight) return;
+  let devices = [];
+  try { devices = ffmpegCaps.available ? listDshowAudioDevices() : []; } catch (e) { return; }
+  const snap = audioDeviceSnapshot(devices);
+  if (snap === lastAudioDeviceSnapshot) return;
+  const prev = lastAudioDeviceSnapshot;
+  lastAudioDeviceSnapshot = snap;
+  if (!prev) return;
+
+  appendDiagnosticsLine(`Audio devices changed (${devices.length} inputs)`);
+
+  if (session && session.audioDevice && !devices.includes(session.audioDevice)) {
+    const next = resolveAudioDevice(devices);
+    if (next && next !== session.audioDevice) {
+      applyAudioDeviceChange(`lost ${session.audioDevice}`, next);
+      return;
+    }
+    applyAudioDeviceChange(`lost ${session.audioDevice}`, null);
+    return;
+  }
+
+  if (session && session.micDevice && !devices.includes(session.micDevice)) {
+    const mic = pickMicrophoneDevice(devices);
+    session.micDevice = mic;
+    appendDiagnosticsLine(`Audio: mic lost, ${mic ? `now ${mic}` : 'no replacement'}`);
+    notifyUser(mic ? `Microphone changed — now using ${mic}` : 'Microphone unplugged — game audio continues');
+    if (mic) restartCurrentSegment();
+  }
+}
+
+function startAudioDevicePolling() {
+  if (audioWatchTimer) return;
+  try {
+    lastAudioDeviceSnapshot = audioDeviceSnapshot(ffmpegCaps.available ? listDshowAudioDevices() : []);
+  } catch (e) {
+    lastAudioDeviceSnapshot = '';
+  }
+  audioWatchTimer = setInterval(() => {
+    try { checkAudioDeviceGuard(); } catch (e) { /* ignore */ }
+  }, 4000);
+}
+
+function stopAudioDevicePolling() {
+  if (audioWatchTimer) {
+    clearInterval(audioWatchTimer);
+    audioWatchTimer = null;
+  }
+}
+
+function testAudioCapture() {
+  refreshAudioProbe({ testWasapi: true });
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) return { ok: false, error: 'FFmpeg not found' };
+  const out = path.join(app.getPath('userData'), 'audio-test.m4a');
+  const args = ['-hide_banner', '-y', '-nostdin'];
+  const wantSystem = settings.audioSource !== 'mic' && settings.recordAudio !== false;
+  const mic = pickMicrophoneDevice(audioProbe.devices);
+  try {
+    if (wantSystem && audioProbe.wasapiWorks) {
+      args.push('-f', 'wasapi', '-i', 'loopback');
+      if (mic) {
+        args.push('-f', 'dshow', '-audio_buffer_size', '80', '-i', `audio=${mic}`);
+        args.push('-filter_complex', '[0:a][1:a]amix=inputs=2:duration=shortest:dropout_transition=0[a]', '-map', '[a]');
+      }
+    } else {
+      const dev = settings.audioSource === 'mic'
+        ? (mic || resolveAudioDevice(audioProbe.devices))
+        : resolveAudioDevice(audioProbe.devices);
+      if (!dev) {
+        return { ok: false, error: audioProbe.hint || 'No audio device to test', probe: audioProbe };
+      }
+      args.push('-f', 'dshow', '-audio_buffer_size', '80', '-i', `audio=${dev}`);
+    }
+    args.push('-t', '3', '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-ar', '48000', out);
+    runFfmpegArgv(ffmpegPath, args, 20000);
+    if (!fs.existsSync(out) || fs.statSync(out).size < 1024) {
+      throw new Error('Test clip was empty');
+    }
+    appendDiagnosticsLine(`Audio test ok (${describeAudioRoute()})`);
+    return { ok: true, url: pathToFileURL(out).href, probe: audioProbe, hint: audioProbe.hint };
+  } catch (e) {
+    const err = String((e && e.stderr) || (e && e.message) || e).slice(0, 240);
+    appendDiagnosticsLine(`Audio test failed: ${err}`);
+    return { ok: false, error: err || 'Audio test failed', probe: audioProbe, hint: audioProbe.hint };
+  }
 }
 
 /** Actually open the encoder for a tiny encode — "-encoders" listing alone lies when AMF HW is missing. */
-function encoderWorks(ffmpegPath, encoderName) {
+function encoderWorks(ffmpegPath, encoderName, timeoutMs = 12000) {
   try {
     execSync(
       `"${ffmpegPath}" -hide_banner -loglevel error -f lavfi -i color=c=black:s=256x256:d=0.2 -pix_fmt yuv420p -c:v ${encoderName} -f null -`,
       {
         encoding: 'utf8',
-        timeout: 12000,
+        timeout: timeoutMs,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true
       }
@@ -492,11 +804,538 @@ function encoderWorks(ffmpegPath, encoderName) {
   } catch (e) {
     const err = `${e.stderr || ''}${e.message || ''}`;
     // Some builds still write frames then exit non-zero on null muxer — treat as OK if no AMF create error
-    if (/frame=\s*[1-9]/i.test(err) && !/CreateComponent\(AMF|Encoder not found|Cannot load AMF/i.test(err)) {
+    if (/frame=\s*[1-9]/i.test(err) && !/CreateComponent\(AMF|Encoder not found|Cannot load AMF|No capable devices|MFX_ERR/i.test(err)) {
       return true;
     }
     console.warn(`Encoder probe failed for ${encoderName}:`, err.slice(0, 240));
     return false;
+  }
+}
+
+const ENCODER_CAP_KEY = {
+  h264_nvenc: 'hasH264Nvenc',
+  hevc_nvenc: 'hasHevcNvenc',
+  av1_nvenc: 'hasAv1Nvenc',
+  h264_amf: 'hasH264Amf',
+  hevc_amf: 'hasHevcAmf',
+  av1_amf: 'hasAv1Amf',
+  h264_qsv: 'hasH264Qsv',
+  hevc_qsv: 'hasHevcQsv',
+  av1_qsv: 'hasAv1Qsv',
+  libx264: null
+};
+
+const ENCODER_LABELS = {
+  h264_nvenc: 'NVIDIA NVENC H.264',
+  hevc_nvenc: 'NVIDIA NVENC H.265',
+  av1_nvenc: 'NVIDIA NVENC AV1',
+  h264_amf: 'AMD AMF H.264',
+  hevc_amf: 'AMD AMF H.265',
+  av1_amf: 'AMD AMF AV1',
+  h264_qsv: 'Intel Quick Sync H.264',
+  hevc_qsv: 'Intel Quick Sync H.265',
+  av1_qsv: 'Intel Quick Sync AV1',
+  libx264: 'Software x264'
+};
+
+function encoderFamilyOf(name) {
+  if (/nvenc/i.test(name)) return 'nvenc';
+  if (/amf/i.test(name)) return 'amf';
+  if (/qsv/i.test(name)) return 'qsv';
+  return 'x264';
+}
+
+function encoderCodecOf(name) {
+  if (/^av1_/i.test(name)) return 'av1';
+  if (/^hevc_/i.test(name)) return 'hevc';
+  return 'h264';
+}
+
+function gpuVendorFromName(name, pnp) {
+  const n = String(name || '');
+  const id = String(pnp || '').toUpperCase();
+  if (/VEN_10DE/.test(id) || /nvidia|geforce|rtx|gtx|quadro/i.test(n)) return 'nvidia';
+  if (/VEN_1002/.test(id) || /amd|radeon|firepro/i.test(n)) return 'amd';
+  if (/VEN_8086/.test(id) || /intel|uhd|iris|arc\s*a?\d/i.test(n)) return 'intel';
+  return 'unknown';
+}
+
+function isDiscreteGpu(name, vendor) {
+  const n = String(name || '');
+  if (vendor === 'nvidia' && /geforce|rtx|gtx|quadro/i.test(n)) return true;
+  if (vendor === 'amd' && /radeon\s*rx|rx\s*\d|vega\s*(1[0-9]|2)|xt\b/i.test(n)) return true;
+  if (vendor === 'intel' && /arc\s*a?\d/i.test(n)) return true;
+  if (/uhd|iris|radeon graphics(?!\s*rx)|vega graphics/i.test(n)) return false;
+  return vendor === 'nvidia' || vendor === 'amd';
+}
+
+function amdLooksHevcSafe(name) {
+  return /rx\s*[4-9]\d{3}|radeon\s*rx|vega|navi|rdna|6900|6800|6700|6600|5700|5600|7800|7900|7600|7700|9070|9060/i.test(String(name || ''));
+}
+
+function nvidiaLooksAv1(name) {
+  return /rtx\s*[45]\d{2,}|ada|blackwell|rtx\s*40|rtx\s*50/i.test(String(name || ''));
+}
+
+function intelLooksAv1(name) {
+  return /arc\s*a?\d|ultra\s*[2579]/i.test(String(name || ''));
+}
+
+function queryGpusWmi() {
+  const ps = [
+    '$ErrorActionPreference = "SilentlyContinue"',
+    '$gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -and $_.Name -notmatch "Remote Desktop|Meta" }',
+    '$rows = @()',
+    'foreach ($g in @($gpus)) {',
+    '  $vram = 0',
+    '  try { if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { $vram = [int64]$g.AdapterRAM } } catch {}',
+    '  $rows += [pscustomobject]@{ Name = [string]$g.Name; AdapterRAM = $vram; PNPDeviceID = [string]$g.PNPDeviceID; DriverVersion = [string]$g.DriverVersion }',
+    '}',
+    'try {',
+    '  Get-ChildItem "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}" -ErrorAction SilentlyContinue | ForEach-Object {',
+    '    $qw = (Get-ItemProperty $_.PSPath -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue)."HardwareInformation.qwMemorySize"',
+    '    $nm = (Get-ItemProperty $_.PSPath -Name DriverDesc -ErrorAction SilentlyContinue).DriverDesc',
+    '    if ($qw -and $nm) {',
+    '      foreach ($r in $rows) { if ($r.Name -eq $nm -and [int64]$qw -gt $r.AdapterRAM) { $r.AdapterRAM = [int64]$qw } }',
+    '    }',
+    '  }',
+    '} catch {}',
+    '$rows | ConvertTo-Json -Compress'
+  ].join('; ');
+  try {
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-Command', ps], {
+      encoding: 'utf8',
+      timeout: 8000,
+      windowsHide: true
+    });
+    const raw = String(r.stdout || '').trim();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    return list.map((g) => ({
+      name: String(g.Name || '').trim(),
+      vramBytes: Math.max(0, Number(g.AdapterRAM) || 0),
+      pnp: String(g.PNPDeviceID || ''),
+      driver: String(g.DriverVersion || ''),
+      vendor: gpuVendorFromName(g.Name, g.PNPDeviceID)
+    })).filter((g) => g.name);
+  } catch (e) {
+    console.warn('GPU WMI probe failed:', e.message || e);
+    return [];
+  }
+}
+
+function classifyHardwareTier(info) {
+  const ramGB = info.ramBytes / (1024 ** 3);
+  const vramGB = info.vramBytes / (1024 ** 3);
+  if (
+    ramGB >= 16 &&
+    info.discrete &&
+    (vramGB >= 6 || info.vendor === 'nvidia' || info.vendor === 'amd') &&
+    info.cpuCores >= 6
+  ) {
+    return 'high';
+  }
+  if (
+    ramGB < 10 ||
+    info.cpuCores <= 4 ||
+    (!info.discrete && ramGB < 16) ||
+    (info.discrete && vramGB > 0 && vramGB < 3)
+  ) {
+    return 'low';
+  }
+  return 'mid';
+}
+
+function probeHardware() {
+  const ramBytes = os.totalmem();
+  const cpus = os.cpus() || [];
+  const gpus = queryGpusWmi();
+  const preferred = gpus.find((g) => g.vendor === 'nvidia')
+    || gpus.find((g) => g.vendor === 'amd')
+    || gpus.find((g) => g.vendor === 'intel')
+    || gpus[0]
+    || null;
+  hardwareInfo.gpus = gpus;
+  hardwareInfo.ramBytes = ramBytes;
+  hardwareInfo.cpuCores = Math.max(1, cpus.length);
+  hardwareInfo.cpuModel = (cpus[0] && cpus[0].model) || 'CPU';
+  hardwareInfo.vendor = preferred ? preferred.vendor : 'unknown';
+  hardwareInfo.gpuName = preferred ? preferred.name : 'Unknown GPU';
+  hardwareInfo.vramBytes = preferred ? preferred.vramBytes : 0;
+  hardwareInfo.discrete = preferred ? isDiscreteGpu(preferred.name, preferred.vendor) : false;
+  hardwareInfo.tier = classifyHardwareTier(hardwareInfo);
+  hardwareInfo.ready = true;
+  return hardwareInfo;
+}
+
+function vendorEncoderChain(vendor, codec) {
+  const c = codec === 'av1' || codec === 'hevc' ? codec : 'h264';
+  const chains = {
+    nvidia: {
+      h264: ['h264_nvenc', 'h264_amf', 'h264_qsv', 'libx264'],
+      hevc: ['hevc_nvenc', 'hevc_amf', 'hevc_qsv', 'h264_nvenc', 'libx264'],
+      av1: ['av1_nvenc', 'av1_amf', 'av1_qsv', 'hevc_nvenc', 'h264_nvenc', 'libx264']
+    },
+    amd: {
+      h264: ['h264_amf', 'h264_nvenc', 'h264_qsv', 'libx264'],
+      hevc: ['hevc_amf', 'hevc_nvenc', 'hevc_qsv', 'h264_amf', 'libx264'],
+      av1: ['av1_amf', 'av1_nvenc', 'av1_qsv', 'hevc_amf', 'h264_amf', 'libx264']
+    },
+    intel: {
+      h264: ['h264_qsv', 'h264_nvenc', 'h264_amf', 'libx264'],
+      hevc: ['hevc_qsv', 'hevc_nvenc', 'hevc_amf', 'h264_qsv', 'libx264'],
+      av1: ['av1_qsv', 'av1_nvenc', 'av1_amf', 'hevc_qsv', 'h264_qsv', 'libx264']
+    },
+    unknown: {
+      h264: ['h264_nvenc', 'h264_amf', 'h264_qsv', 'libx264'],
+      hevc: ['hevc_nvenc', 'hevc_amf', 'hevc_qsv', 'h264_nvenc', 'libx264'],
+      av1: ['av1_nvenc', 'av1_amf', 'av1_qsv', 'hevc_nvenc', 'libx264']
+    }
+  };
+  return (chains[vendor] || chains.unknown)[c];
+}
+
+function familyOverrideChain(family, codec) {
+  const c = codec === 'av1' || codec === 'hevc' ? codec : 'h264';
+  const map = {
+    nvenc: { h264: ['h264_nvenc', 'libx264'], hevc: ['hevc_nvenc', 'h264_nvenc', 'libx264'], av1: ['av1_nvenc', 'hevc_nvenc', 'h264_nvenc', 'libx264'] },
+    amf: { h264: ['h264_amf', 'libx264'], hevc: ['hevc_amf', 'h264_amf', 'libx264'], av1: ['av1_amf', 'hevc_amf', 'h264_amf', 'libx264'] },
+    qsv: { h264: ['h264_qsv', 'libx264'], hevc: ['hevc_qsv', 'h264_qsv', 'libx264'], av1: ['av1_qsv', 'hevc_qsv', 'h264_qsv', 'libx264'] },
+    x264: { h264: ['libx264'], hevc: ['libx264'], av1: ['libx264'] }
+  };
+  return (map[family] || map.x264)[c];
+}
+
+function encoderIsAvailable(name) {
+  if (name === 'libx264') return true;
+  const key = ENCODER_CAP_KEY[name];
+  return Boolean(key && ffmpegCaps[key]);
+}
+
+function describeEncoder(name, reason) {
+  return {
+    ffmpegName: name,
+    family: encoderFamilyOf(name),
+    codec: encoderCodecOf(name),
+    label: ENCODER_LABELS[name] || name,
+    hardware: name !== 'libx264',
+    reason
+  };
+}
+
+function pickActiveEncoder({ hardware = true } = {}) {
+  if (!hardware) {
+    return describeEncoder('libx264', 'Software fallback (hardware encode disabled for this session)');
+  }
+  const codec = settings.videoCodec === 'hevc' || settings.videoCodec === 'av1' ? settings.videoCodec : 'h264';
+  const override = settings.encoder || 'auto';
+  const chain = override === 'auto'
+    ? vendorEncoderChain(hardwareInfo.vendor || 'unknown', codec)
+    : familyOverrideChain(override, codec);
+  for (const name of chain) {
+    if (encoderIsAvailable(name)) {
+      const why = override === 'auto'
+        ? `Auto: ${hardwareInfo.vendor || 'unknown'} GPU (${hardwareInfo.gpuName}) → ${ENCODER_LABELS[name] || name}`
+        : `Manual override (${override}) → ${ENCODER_LABELS[name] || name}`;
+      return describeEncoder(name, why);
+    }
+  }
+  return describeEncoder('libx264', 'No working hardware encoder; using libx264');
+}
+
+function refreshSelectedEncoder() {
+  hardwareInfo.encoder = pickActiveEncoder({ hardware: true });
+  hardwareInfo.reason = hardwareInfo.encoder.reason;
+  return hardwareInfo.encoder;
+}
+
+function captureBitrateBps({ forReplay = false } = {}) {
+  const codec = (hardwareInfo.encoder && hardwareInfo.encoder.codec) || settings.videoCodec || 'h264';
+  let bits = 8_000_000;
+  if (forReplay) bits = 5_000_000;
+  else if (settings.spaceSaving) bits = 8_000_000;
+  else if (!settings.gameMode) bits = 10_000_000;
+  else bits = 8_000_000;
+  if (codec === 'hevc') bits = Math.round(bits * 0.65);
+  if (codec === 'av1') bits = Math.round(bits * 0.5);
+  return bits;
+}
+
+function estimateFileBytesPerMinute() {
+  const video = captureBitrateBps({ forReplay: false });
+  const audio = settings.recordAudio ? 160_000 : 0;
+  return Math.round(((video + audio) / 8) * 60);
+}
+
+function capturePixelSize() {
+  try {
+    const disp = screen.getPrimaryDisplay();
+    const w = (disp && disp.size && disp.size.width) || 1920;
+    const h = (disp && disp.size && disp.size.height) || 1080;
+    const r = settings.outputResolution;
+    if (r === '720') return { width: Math.round(w * (720 / h)), height: 720 };
+    if (r === '1080') return { width: Math.round(w * (1080 / h)), height: 1080 };
+    if (r === '1440') return { width: Math.round(w * (1440 / h)), height: 1440 };
+    return { width: w, height: h };
+  } catch (e) {
+    return { width: 1920, height: 1080 };
+  }
+}
+
+function estimateReplayRamBytes({ minutes, fps } = {}) {
+  const mins = Math.max(0.5, Number(minutes != null ? minutes : settings.instantReplayMinutes) || 5);
+  const rate = Number(fps != null ? fps : effectiveFps()) || 30;
+  const { width, height } = capturePixelSize();
+  const encoded = (captureBitrateBps({ forReplay: true }) / 8) * mins * 60;
+  const pcm = 48000 * 4 * mins * 60;
+  const frameQueue = width * height * 4 * Math.min(rate, 8);
+  return Math.round(encoded + pcm + frameQueue);
+}
+
+function maxReplayMinutesForRam() {
+  const ramGB = hardwareInfo.ramBytes / (1024 ** 3);
+  const fps = effectiveFps();
+  const { height } = capturePixelSize();
+  let cap = 5;
+  if (ramGB < 10) {
+    if (fps >= 144 && height >= 1080) cap = 1;
+    else if (fps >= 60 && height >= 1080) cap = 2;
+    else if (height >= 1080) cap = 3;
+    else cap = 5;
+  } else if (ramGB < 16) {
+    if (fps >= 144) cap = 2;
+    else if (fps >= 60 && height >= 1440) cap = 3;
+    else if (fps >= 60) cap = 4;
+    else cap = 5;
+  }
+  const budget = Math.max(256 * 1024 * 1024, hardwareInfo.ramBytes * 0.08);
+  for (const m of [5, 4, 3, 2, 1]) {
+    if (m > cap) continue;
+    if (estimateReplayRamBytes({ minutes: m, fps }) <= budget) return m;
+  }
+  return 1;
+}
+
+function wizardDefaultsForTier(tier) {
+  const hevcOk = Boolean(ffmpegCaps.hasHevcNvenc || ffmpegCaps.hasHevcAmf || ffmpegCaps.hasHevcQsv);
+  const ramGB = hardwareInfo.ramBytes / (1024 ** 3);
+  const vramGB = hardwareInfo.vramBytes / (1024 ** 3);
+  if (tier === 'low') {
+    return {
+      fps: 30,
+      outputResolution: '720',
+      instantReplayMinutes: 2,
+      instantReplaySaveMinutes: 1,
+      videoCodec: 'h264',
+      spaceSaving: true,
+      encoder: 'auto'
+    };
+  }
+  if (tier === 'high') {
+    const fps = ramGB >= 32 && vramGB >= 8 ? 144 : 60;
+    return {
+      fps,
+      outputResolution: vramGB >= 6 ? '1440' : '1080',
+      instantReplayMinutes: 5,
+      instantReplaySaveMinutes: 2,
+      videoCodec: hevcOk ? 'hevc' : 'h264',
+      spaceSaving: false,
+      encoder: 'auto'
+    };
+  }
+  return {
+    fps: 60,
+    outputResolution: '1080',
+    instantReplayMinutes: 3,
+    instantReplaySaveMinutes: 2,
+    videoCodec: 'h264',
+    spaceSaving: true,
+    encoder: 'auto'
+  };
+}
+
+function diagnosticsLogPath() {
+  return path.join(app.getPath('userData'), 'diagnostics.log');
+}
+
+function writeDiagnosticsLog() {
+  const enc = hardwareInfo.encoder || pickActiveEncoder({ hardware: true });
+  const lines = [
+    `Ordinary Recorder diagnostics  ${new Date().toISOString()}`,
+    `app ${app.getVersion()}  settings v${settings.settingsVersion}`,
+    '',
+    '-- Hardware --',
+    `GPU: ${hardwareInfo.gpuName} (${hardwareInfo.vendor}, ${hardwareInfo.discrete ? 'discrete' : 'integrated'})`,
+    `VRAM: ${(hardwareInfo.vramBytes / (1024 ** 3)).toFixed(1)} GB`,
+    `RAM: ${(hardwareInfo.ramBytes / (1024 ** 3)).toFixed(1)} GB`,
+    `CPU: ${hardwareInfo.cpuModel} (${hardwareInfo.cpuCores} threads)`,
+    `Tier: ${hardwareInfo.tier}`,
+    `Other GPUs: ${hardwareInfo.gpus.map((g) => g.name).join(' | ') || '(none)'}`,
+    '',
+    '-- FFmpeg --',
+    `path: ${ffmpegCaps.path}`,
+    `available: ${ffmpegCaps.available}  ddagrab: ${ffmpegCaps.hasDdagrab}  wasapi: ${ffmpegCaps.hasWasapi}`,
+    `nvenc h264/hevc/av1: ${ffmpegCaps.hasH264Nvenc}/${ffmpegCaps.hasHevcNvenc}/${ffmpegCaps.hasAv1Nvenc}`,
+    `amf   h264/hevc/av1: ${ffmpegCaps.hasH264Amf}/${ffmpegCaps.hasHevcAmf}/${ffmpegCaps.hasAv1Amf}`,
+    `qsv   h264/hevc/av1: ${ffmpegCaps.hasH264Qsv}/${ffmpegCaps.hasHevcQsv}/${ffmpegCaps.hasAv1Qsv}`,
+    '',
+    '-- Encoder selection --',
+    `${enc.label}  (${enc.ffmpegName})`,
+    enc.reason,
+    `override=${settings.encoder}  codec=${settings.videoCodec}  fps=${settings.fps}  res=${settings.outputResolution}`,
+    `replay cap: ${maxReplayMinutesForRam()} min  est RAM @ current buffer: ${(estimateReplayRamBytes() / (1024 ** 2)).toFixed(0)} MB`,
+    '',
+    '-- Audio --',
+    describeAudioRoute(),
+    audioProbe.hint || '',
+    '',
+    '-- Disk --',
+    `reserve: ${settings.diskSpaceLimitMb || 500} MB  free now: ${lastDiskFreeBytes != null ? `${Math.round(lastDiskFreeBytes / (1024 * 1024))} MB` : 'n/a'}`,
+    '',
+    '-- Known unstable games (skip ddagrab) --',
+    ...(settings.knownUnstableGames && settings.knownUnstableGames.length
+      ? settings.knownUnstableGames.map((g) => `${g.exe || g.id}  (${g.title})`)
+      : ['(none)']),
+    ''
+  ];
+  try {
+    fs.writeFileSync(diagnosticsLogPath(), lines.join('\n'), 'utf8');
+    console.log(lines.join('\n'));
+  } catch (e) {
+    console.warn('Could not write diagnostics log:', e.message || e);
+  }
+}
+
+function encoderOptionsForUi() {
+  const enc = hardwareInfo.encoder || pickActiveEncoder({ hardware: true });
+  const codecs = [{ value: 'h264', label: 'H.264', available: true }];
+  if (ffmpegCaps.hasHevcNvenc || ffmpegCaps.hasHevcAmf || ffmpegCaps.hasHevcQsv) {
+    codecs.push({ value: 'hevc', label: 'H.265 (HEVC)', available: true });
+  }
+  if (ffmpegCaps.hasAv1Nvenc || ffmpegCaps.hasAv1Amf || ffmpegCaps.hasAv1Qsv) {
+    codecs.push({ value: 'av1', label: 'AV1', available: true });
+  }
+  const withCodec = (codec) => {
+    const prev = settings.videoCodec;
+    settings.videoCodec = codec;
+    const n = estimateFileBytesPerMinute();
+    settings.videoCodec = prev;
+    return n;
+  };
+  const h264Bytes = withCodec('h264');
+  const hevcBytes = withCodec('hevc');
+  const av1Bytes = withCodec('av1');
+  return {
+    selected: enc,
+    encoder: settings.encoder || 'auto',
+    videoCodec: settings.videoCodec || 'h264',
+    families: [
+      { value: 'auto', label: `Auto (${enc.label})` },
+      { value: 'nvenc', label: 'NVIDIA NVENC', available: Boolean(ffmpegCaps.hasH264Nvenc || ffmpegCaps.hasHevcNvenc) },
+      { value: 'amf', label: 'AMD AMF', available: Boolean(ffmpegCaps.hasH264Amf || ffmpegCaps.hasHevcAmf) },
+      { value: 'qsv', label: 'Intel Quick Sync', available: Boolean(ffmpegCaps.hasH264Qsv || ffmpegCaps.hasHevcQsv) },
+      { value: 'x264', label: 'Software (x264)', available: true }
+    ],
+    codecs,
+    sizeEstimate: {
+      h264BytesPerMin: h264Bytes,
+      hevcBytesPerMin: hevcBytes,
+      av1BytesPerMin: av1Bytes,
+      currentBytesPerMin: estimateFileBytesPerMinute()
+    },
+    replay: {
+      estimatedRamBytes: estimateReplayRamBytes(),
+      maxMinutes: maxReplayMinutesForRam()
+    }
+  };
+}
+
+function getHardwareUiPayload() {
+  refreshSelectedEncoder();
+  return {
+    ready: hardwareInfo.ready,
+    vendor: hardwareInfo.vendor,
+    gpuName: hardwareInfo.gpuName,
+    vramBytes: hardwareInfo.vramBytes,
+    ramBytes: hardwareInfo.ramBytes,
+    cpuCores: hardwareInfo.cpuCores,
+    cpuModel: hardwareInfo.cpuModel,
+    discrete: hardwareInfo.discrete,
+    tier: hardwareInfo.tier,
+    wizardCompleted: Boolean(settings.wizardCompleted),
+    profile: settings.hardwareProfile,
+    defaults: wizardDefaultsForTier(hardwareInfo.tier),
+    encoder: encoderOptionsForUi(),
+    encodersProbed: Boolean(ffmpegCaps.available || ffmpegCaps.probeError),
+    diagnosticsPath: diagnosticsLogPath()
+  };
+}
+
+function scaleFilterForResolution() {
+  const r = settings.outputResolution;
+  if (r === '720') return 'scale=-2:720';
+  if (r === '1080') return 'scale=-2:1080';
+  if (r === '1440') return 'scale=-2:1440';
+  return null;
+}
+
+function pushVendorEncoderArgs(args, { fps, forReplay, encoder }) {
+  const gop = fps;
+  const bits = captureBitrateBps({ forReplay });
+  const maxrate = Math.round(bits * 1.25);
+  const bufsize = Math.round(bits * 1.5);
+  const name = encoder.ffmpegName;
+  args.push('-c:v', name);
+  if (encoder.family === 'nvenc') {
+    args.push('-preset', 'p4', '-rc', 'vbr', '-b:v', String(bits), '-maxrate', String(maxrate), '-bufsize', String(bufsize), '-g', String(gop), '-bf', '0');
+    if (encoder.codec !== 'av1') args.push('-tune', 'll');
+    if (encoder.codec === 'hevc') args.push('-tag:v', 'hvc1');
+  } else if (encoder.family === 'qsv') {
+    args.push('-preset', 'veryfast', '-look_ahead', '0', '-b:v', String(bits), '-maxrate', String(maxrate), '-bufsize', String(bufsize), '-g', String(gop), '-bf', '0');
+    if (encoder.codec === 'hevc') args.push('-tag:v', 'hvc1');
+  } else if (encoder.family === 'amf') {
+    args.push('-usage', 'transcoding', '-quality', 'speed', '-rc', 'vbr_peak', '-b:v', String(bits), '-maxrate', String(maxrate), '-bufsize', String(bufsize), '-g', String(gop), '-bf', '0');
+    if (encoder.codec === 'hevc') args.push('-tag:v', 'hvc1');
+  }
+}
+
+function webCodecsCodecParam() {
+  const enc = pickActiveEncoder({ hardware: true });
+  if (!enc.hardware) return 'h264';
+  return enc.codec === 'av1' || enc.codec === 'hevc' ? enc.codec : 'h264';
+}
+
+function probeListedHwEncoders(ffmpegPath, listed) {
+  const vendor = hardwareInfo.vendor || 'unknown';
+  const gpuName = hardwareInfo.gpuName || '';
+  const tryProbe = (name, timeoutMs) => {
+    if (!new RegExp(`\\b${name}\\b`, 'i').test(listed)) return false;
+    const key = ENCODER_CAP_KEY[name];
+    if (!key) return false;
+    ffmpegCaps[key] = encoderWorks(ffmpegPath, name, timeoutMs);
+    return ffmpegCaps[key];
+  };
+
+  if (vendor === 'nvidia') {
+    tryProbe('h264_nvenc', 10000);
+  } else if (vendor === 'amd') {
+    tryProbe('h264_amf', 12000);
+  } else if (vendor === 'intel') {
+    tryProbe('h264_qsv', 10000);
+  } else if (!tryProbe('h264_nvenc', 8000) && !tryProbe('h264_amf', 8000)) {
+    tryProbe('h264_qsv', 8000);
+  }
+
+  if (vendor === 'nvidia') {
+    tryProbe('hevc_nvenc', 8000);
+    if (nvidiaLooksAv1(gpuName)) tryProbe('av1_nvenc', 8000);
+  } else if (vendor === 'amd') {
+    if (amdLooksHevcSafe(gpuName)) tryProbe('hevc_amf', 7000);
+    if (/rx\s*[79]\d{3}|9070|9060|rdna.?3|rdna.?4/i.test(gpuName)) tryProbe('av1_amf', 7000);
+  } else if (vendor === 'intel') {
+    tryProbe('hevc_qsv', 8000);
+    if (intelLooksAv1(gpuName)) tryProbe('av1_qsv', 8000);
   }
 }
 
@@ -515,6 +1354,14 @@ function probeFfmpeg() {
     hasDdagrab: false,
     hasH264Amf: false,
     hasHevcAmf: false,
+    hasAv1Amf: false,
+    hasH264Nvenc: false,
+    hasHevcNvenc: false,
+    hasAv1Nvenc: false,
+    hasH264Qsv: false,
+    hasHevcQsv: false,
+    hasAv1Qsv: false,
+    hasWasapi: false,
     probeError: null
   };
 
@@ -536,19 +1383,46 @@ function probeFfmpeg() {
     caps.hasDdagrab = /\bddagrab\b/i.test(out);
   }
 
-  let listsH264Amf = false;
+  let listedEncoders = '';
   try {
-    const encoders = runFfmpeg('-hide_banner -encoders', 30000);
-    listsH264Amf = /\bh264_amf\b/i.test(encoders);
+    listedEncoders = runFfmpeg('-hide_banner -encoders', 30000);
   } catch (e) {
-    const out = `${e.stdout || ''}${e.stderr || ''}`;
-    listsH264Amf = /\bh264_amf\b/i.test(out);
+    listedEncoders = `${e.stdout || ''}${e.stderr || ''}`;
   }
 
-  // Only probe h264_amf — hevc_amf fails on this GPU and only freezes startup
-  caps.hasH264Amf = listsH264Amf && encoderWorks(ffmpegPath, 'h264_amf');
-  caps.hasHevcAmf = false;
-  console.log('Encoder caps:', { hasH264Amf: caps.hasH264Amf, hasHevcAmf: caps.hasHevcAmf, hasDdagrab: caps.hasDdagrab });
+  ffmpegCaps = caps;
+  probeListedHwEncoders(ffmpegPath, listedEncoders);
+  caps.hasH264Amf = Boolean(ffmpegCaps.hasH264Amf);
+  caps.hasHevcAmf = Boolean(ffmpegCaps.hasHevcAmf);
+  caps.hasAv1Amf = Boolean(ffmpegCaps.hasAv1Amf);
+  caps.hasH264Nvenc = Boolean(ffmpegCaps.hasH264Nvenc);
+  caps.hasHevcNvenc = Boolean(ffmpegCaps.hasHevcNvenc);
+  caps.hasAv1Nvenc = Boolean(ffmpegCaps.hasAv1Nvenc);
+  caps.hasH264Qsv = Boolean(ffmpegCaps.hasH264Qsv);
+  caps.hasHevcQsv = Boolean(ffmpegCaps.hasHevcQsv);
+  caps.hasAv1Qsv = Boolean(ffmpegCaps.hasAv1Qsv);
+
+  try {
+    const formats = runFfmpeg('-hide_banner -formats', 30000);
+    caps.hasWasapi = /^\s*[D ]+E?\s+wasapi\s/im.test(formats) || /\bDE\s+wasapi\b/i.test(formats);
+  } catch (e) {
+    const out = `${e.stdout || ''}${e.stderr || ''}`;
+    caps.hasWasapi = /\bwasapi\b/i.test(out);
+  }
+  refreshSelectedEncoder();
+  console.log('Encoder caps:', {
+    vendor: hardwareInfo.vendor,
+    selected: hardwareInfo.encoder && hardwareInfo.encoder.ffmpegName,
+    reason: hardwareInfo.reason,
+    hasH264Amf: caps.hasH264Amf,
+    hasH264Nvenc: caps.hasH264Nvenc,
+    hasH264Qsv: caps.hasH264Qsv,
+    hasHevcAmf: caps.hasHevcAmf,
+    hasHevcNvenc: caps.hasHevcNvenc,
+    hasHevcQsv: caps.hasHevcQsv,
+    hasDdagrab: caps.hasDdagrab,
+    hasWasapi: caps.hasWasapi
+  });
 
   try {
     const devices = listDshowAudioDevices();
@@ -595,6 +1469,13 @@ async function probeFfmpegAsync() {
     hasDdagrab: false,
     hasH264Amf: false,
     hasHevcAmf: false,
+    hasAv1Amf: false,
+    hasH264Nvenc: false,
+    hasHevcNvenc: false,
+    hasAv1Nvenc: false,
+    hasH264Qsv: false,
+    hasHevcQsv: false,
+    hasAv1Qsv: false,
     probeError: 'Could not start ffmpeg after retries'
   };
   ffmpegCaps = caps;
@@ -658,8 +1539,8 @@ function showFfmpegWarning(caps) {
     return;
   }
 
-  if (!caps.hasH264Amf && !caps.hasHevcAmf) {
-    console.warn('AMF unavailable — using libx264 software encode (higher CPU).');
+  if (!caps.hasH264Amf && !caps.hasHevcAmf && !caps.hasH264Nvenc && !caps.hasH264Qsv) {
+    console.warn('No hardware encoder — using libx264 software encode (higher CPU).');
   }
 }
 
@@ -668,8 +1549,10 @@ function getSelectedAudioDevice() {
 }
 
 function effectiveFps() {
-  const f = Number(settings.fps) === 60 ? 60 : 30;
-  return f;
+  const f = Number(settings.fps);
+  if (f === 144) return 144;
+  if (f === 60) return 60;
+  return 30;
 }
 
 function effectiveReplayFps() {
@@ -726,8 +1609,39 @@ function pushDesktopCaptureArgs(args, { fps, useDdagrab }) {
  * on current FFmpeg/D3D11 (fails Instant Replay with error -22).
  */
 function videoFilterForCapture(useDdagrab, { useAmf } = {}) {
-  if (!(useDdagrab && ffmpegCaps.hasDdagrab)) return null;
-  return 'hwdownload,format=bgra,format=nv12';
+  const scale = scaleFilterForResolution();
+  if (!(useDdagrab && ffmpegCaps.hasDdagrab)) return scale;
+  const base = 'hwdownload,format=bgra,format=nv12';
+  return scale ? `${base},${scale}` : base;
+}
+
+function cueFile(kind) {
+  const names = {
+    start: 'cue-start.wav',
+    stop: 'cue-stop.wav',
+    bookmark: 'cue-bookmark.wav',
+    saved: 'cue-saved.wav',
+    fail: 'cue-fail.wav'
+  };
+  const name = names[kind] || names.stop;
+  if (app.isPackaged) return path.join(process.resourcesPath, 'assets', name);
+  return path.join(__dirname, 'assets', name);
+}
+
+function playCue(kind) {
+  const file = cueFile(kind);
+  try {
+    if (!fs.existsSync(file)) return;
+  } catch (e) {
+    return;
+  }
+  const quoted = file.replace(/'/g, "''");
+  const proc = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', `(New-Object System.Media.SoundPlayer '${quoted}').PlaySync()`],
+    { windowsHide: true, detached: true, stdio: 'ignore' }
+  );
+  try { proc.unref(); } catch (e) { /* ignore */ }
 }
 
 /** Keep UI out of the way without killing the recording window. */
@@ -745,8 +1659,9 @@ function restoreMainWindow() {
 function pushStableVideoEncoderArgs(args, { fps, useAmf, forReplay }) {
   const gop = fps; // 1s GOP
   const game = Boolean(settings.gameMode);
+  const picked = pickActiveEncoder({ hardware: useAmf });
 
-  if (useAmf && ffmpegCaps.hasH264Amf) {
+  if (useAmf && picked.family === 'amf' && picked.codec === 'h264' && ffmpegCaps.hasH264Amf) {
     // Avoid cavlc/passthrough quirks — those caused colorful block glitches on playback
     args.push(
       '-c:v', 'h264_amf',
@@ -786,37 +1701,58 @@ function pushStableVideoEncoderArgs(args, { fps, useAmf, forReplay }) {
         '-bf', '0'
       );
     }
-  } else {
-    // Software fallback — keep ultrafast so games stay playable
-    args.push(
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'zerolatency',
-      '-crf', settings.spaceSaving ? '26' : '21',
-      '-g', String(gop),
-      '-keyint_min', String(gop),
-      '-sc_threshold', '0',
-      '-bf', '0'
-    );
+    return;
   }
+
+  if (useAmf && picked.hardware && picked.ffmpegName !== 'libx264') {
+    pushVendorEncoderArgs(args, { fps, forReplay, encoder: picked });
+    return;
+  }
+
+  // Software fallback — keep ultrafast so games stay playable
+  args.push(
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-tune', 'zerolatency',
+    '-crf', settings.spaceSaving ? '26' : '21',
+    '-g', String(gop),
+    '-keyint_min', String(gop),
+    '-sc_threshold', '0',
+    '-bf', '0'
+  );
 }
 
 // ---------- Build the ffmpeg args ----------
-function buildArgs(outputFile, { useDdagrab, useAmf, audioDevice, useWasapi }) {
+function buildArgs(outputFile, { useDdagrab, useAmf, audioDevice, micDevice, useWasapi }) {
   const fps = effectiveFps();
   const args = [];
   const game = Boolean(settings.gameMode);
+  const wasapi = Boolean(useWasapi && ffmpegCaps.hasWasapi);
+  const mixMic = Boolean(
+    !wasapi &&
+    audioDevice &&
+    micDevice &&
+    micDevice !== audioDevice
+  );
+  const mixWasapiMic = Boolean(wasapi && micDevice);
 
-  // 1) All inputs first
   pushDesktopCaptureArgs(args, { fps, useDdagrab });
 
-  const wantAudio = Boolean(useWasapi) || Boolean(audioDevice);
-  if (useWasapi) {
+  const wantAudio = wasapi || Boolean(audioDevice);
+  if (wasapi) {
     args.push(
       '-thread_queue_size', game ? '1024' : '256',
       '-f', 'wasapi',
       '-i', 'loopback'
     );
+    if (mixWasapiMic) {
+      args.push(
+        '-thread_queue_size', '256',
+        '-f', 'dshow',
+        '-audio_buffer_size', '80',
+        '-i', `audio=${micDevice}`
+      );
+    }
   } else if (audioDevice) {
     args.push(
       '-thread_queue_size', game ? '1024' : '256',
@@ -824,18 +1760,33 @@ function buildArgs(outputFile, { useDdagrab, useAmf, audioDevice, useWasapi }) {
       '-audio_buffer_size', '80',
       '-i', `audio=${audioDevice}`
     );
+    if (mixMic) {
+      args.push(
+        '-thread_queue_size', '256',
+        '-f', 'dshow',
+        '-audio_buffer_size', '80',
+        '-i', `audio=${micDevice}`
+      );
+    }
   }
 
-  // 2) Filters after every -i (critical for FFmpeg 8 + audio)
   const vf = videoFilterForCapture(useDdagrab, { useAmf });
-  if (vf) args.push('-filter:v', vf);
-
-  // Keep A/V aligned without dropping video when desktop audio clock drifts
-  if (wantAudio && game) {
-    args.push('-af', 'aresample=async=1000:first_pts=0');
+  if (mixWasapiMic || mixMic) {
+    const videoChain = vf || 'null';
+    const a1 = mixWasapiMic ? '1' : '1';
+    const a2 = '2';
+    args.push(
+      '-filter_complex',
+      `[0:v]${videoChain}[v];[${a1}:a]aresample=48000:async=1000,aformat=sample_fmts=fltp:channel_layouts=stereo[a1];[${a2}:a]aresample=48000:async=1000,aformat=sample_fmts=fltp:channel_layouts=stereo[a2];[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2[a]`
+    );
+    args.push('-map', '[v]', '-map', '[a]');
+  } else {
+    if (vf) args.push('-filter:v', vf);
+    if (wantAudio && game) {
+      args.push('-af', 'aresample=async=1000:first_pts=0');
+    }
   }
 
-  // 3) Encoders / mux
   pushStableVideoEncoderArgs(args, { fps, useAmf, forReplay: false });
 
   if (wantAudio) {
@@ -850,15 +1801,19 @@ function buildArgs(outputFile, { useDdagrab, useAmf, audioDevice, useWasapi }) {
   args.push(
     '-fps_mode', 'cfr',
     '-max_muxing_queue_size', game ? '2048' : '1024',
-    '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+    '-f', 'matroska',
     '-y', outputFile
   );
   return args;
 }
 
+function isExclusiveFullscreenCaptureFailure(msg) {
+  return /Selected output not supported|Failed to configure output pad on Parsed_ddagrab|887a0026|887a0027|AcquireNextFrame failed/i.test(String(msg || ''));
+}
+
 function isDdagrabFailure(msg) {
   // Do NOT match mere mentions of "ddagrab" — normal startup logs include the filter name.
-  return /No such filter.*ddagrab|Unknown (input )?filter.*ddagrab|Filter not found.*ddagrab|Error .*ddagrab|ddagrab.*fail|Cannot load.*ddagrab|Failed to.*Desktop Duplication|DXGI_ERROR|AcquireNextFrame failed|887a0026|887a0027/i.test(msg);
+  return /No such filter.*ddagrab|Unknown (input )?filter.*ddagrab|Filter not found.*ddagrab|Error .*ddagrab|ddagrab.*fail|Cannot load.*ddagrab|Failed to.*Desktop Duplication|DXGI_ERROR|AcquireNextFrame failed|887a0026|887a0027|Selected output not supported/i.test(msg);
 }
 
 function isAmfFailure(msg) {
@@ -866,12 +1821,24 @@ function isAmfFailure(msg) {
   return /CreateComponent\(AMF|Cannot load AMF|Error initializing.*(h264_amf|hevc_amf|AMF)|Encoder not found|Failed to open (encoder|codec).*(h264_amf|hevc_amf)|(h264_amf|hevc_amf).*failed with error|Error while opening encoder/i.test(msg);
 }
 
+function isNvencFailure(msg) {
+  return /No NVENC capable devices|OpenEncodeSessionEx|incompatible with nvenc|Failed to open (encoder|codec).*nvenc|nvenc.*failed with error|Error initializing.*nvenc/i.test(String(msg || ''));
+}
+
+function isQsvFailure(msg) {
+  return /libmfx|MFX_ERR|Failed to open (encoder|codec).*qsv|Error initializing.*qsv|qsv.*failed with error|Cannot load.*libmfx/i.test(String(msg || ''));
+}
+
+function isSelectedHwFailure(msg) {
+  return isAmfFailure(msg) || isNvencFailure(msg) || isQsvFailure(msg);
+}
+
 function isAmfHwFormatFailure(msg) {
   return /Impossible to convert|No matching formats|Unsupported pixel format|Could not get .* format|Error reinitializing filters|Error while filtering|Function not implemented|surfaces are not supported|Failed to inject frame into filter network|Error while processing the decoded data/i.test(msg);
 }
 
 function isAudioFailure(msg) {
-  return /Could not find audio only device|IAudioClient|Error opening input.*dshow|Could not run graph|audio device.*not found|Cannot open.*dshow|Unknown input format.*wasapi|wasapi.*(error|fail)|Failed to (open|init).*wasapi/i.test(msg);
+  return /Could not find audio only device|IAudioClient|Error opening input.*dshow|Could not run graph|audio device.*not found|Cannot open.*dshow|Unknown input format.*wasapi|wasapi.*(error|fail)|Failed to (open|init).*wasapi|device.*disconnected|The device is not plugged|No such device/i.test(msg);
 }
 
 function isCaptureDropMessage(msg) {
@@ -892,6 +1859,8 @@ function resetCaptureStats() {
   borderlessWarnShown = false;
   lastFpsUiAt = 0;
   lastAudioPeak = 0;
+  lastLoopbackPeak = 0;
+  lastMicPeak = 0;
 }
 
 function surfaceBorderlessWarning() {
@@ -1003,17 +1972,42 @@ function getStatePayload() {
     pttHeld,
     pttKey: settings.pttKey || 'V',
     pttEnabled: settings.pttEnabled === true,
-    hasAudio: Boolean(medal.hasAudio),
-    audioLive: Boolean(medal.hasAudio && lastAudioPeak > 0.004),
+    hasAudio: Boolean(
+      medal.hasAudio ||
+      loopbackReady ||
+      (session && !session.audioDropped && (session.audioOpened || session.audioDevice || session.useWasapi || session.useLoopback))
+    ),
+    audioLive: Boolean(
+      lastAudioPeak > 0.004 ||
+      lastLoopbackPeak > 0.004 ||
+      lastMicPeak > 0.004 ||
+      (medal.hasAudio && lastAudioPeak > 0.004) ||
+      (session && session.audioOpened && !session.audioDropped)
+    ),
+    loopbackPeak: lastLoopbackPeak > 0
+      ? lastLoopbackPeak
+      : (session && session.useWasapi && session.audioOpened && !session.audioDropped ? 0.22 : 0),
+    micPeak: lastMicPeak,
+    audioRoute: audioProbe.loopbackKind || null,
+    audioWarning: Boolean(audioProbe.warning),
+    audioHint: audioProbe.hint || '',
     hotkey: settings.hotkey,
     pauseHotkey: settings.pauseHotkey,
     replayHotkey: settings.replayHotkey,
-    instantReplay: getInstantReplayState()
+    bookmarkHotkey: settings.bookmarkHotkey,
+    instantReplay: getInstantReplayState(),
+    captureTarget: !isRecording ? null : (usingGameCapture || medal.recording ? 'game' : 'desktop'),
+    encoder: (hardwareInfo.encoder && hardwareInfo.encoder.label) || null,
+    diskFreeBytes: lastDiskFreeBytes,
+    diskLimitBytes: diskSpaceLimitBytes(),
+    diskWarning: lastDiskWarning,
+    notice: lastAppNotice
   };
 }
 
 function startStatsPolling() {
   stopStatsPolling();
+  startAudioDevicePolling();
   let lastSize = 0;
   let stalledChecks = 0;
   statsInterval = setInterval(() => {
@@ -1030,7 +2024,7 @@ function startStatsPolling() {
       if (stalledChecks >= 3 && mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('recording-state', {
           ...getStatePayload(),
-          warning: 'Capture looks empty — press Ctrl+Shift+R while the game is already fullscreen'
+          warning: 'Capture looks empty — if a game is exclusive fullscreen, press the hotkey while that game is in front'
         });
       }
     }
@@ -1043,6 +2037,7 @@ function stopStatsPolling() {
     clearInterval(statsInterval);
     statsInterval = null;
   }
+  stopAudioDevicePolling();
 }
 
 function waitForProcessClose(proc, timeoutMs = 20000) {
@@ -1084,7 +2079,7 @@ function escapeConcatPath(filePath) {
   return filePath.replace(/\\/g, '/').replace(/'/g, "'\\''");
 }
 
-function concatSegments(segments, outputFile) {
+function concatSegments(segments, outputFile, listDir) {
   const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
   if (!segments.length) throw new Error('No segments to concatenate');
 
@@ -1102,28 +2097,653 @@ function concatSegments(segments, outputFile) {
     return;
   }
 
-  const listFile = path.join(session.folder, 'segments-list.txt');
+  const dir = listDir || (session && session.folder) || path.dirname(outputFile);
+  const listFile = path.join(dir, 'segments-list.txt');
   const body = segments.map((s) => `file '${escapeConcatPath(s)}'`).join('\n');
   fs.writeFileSync(listFile, body, 'utf8');
 
-  execSync(
-    `"${ffmpegPath}" -hide_banner -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outputFile}"`,
-    {
+  const run = (args) => {
+    execSync(`"${ffmpegPath}" ${args}`, {
       encoding: 'utf8',
-      timeout: 180000,
+      timeout: 300000,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true
-    }
-  );
+    });
+  };
+
+  try {
+    run(`-hide_banner -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outputFile}"`);
+  } catch (e) {
+    console.warn('concat copy failed, remuxing:', e.message || e);
+    run(`-hide_banner -y -f concat -safe 0 -i "${listFile}" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 160k -movflags +faststart "${outputFile}"`);
+  }
 }
+
+function muxLoopbackAudio(videoFile, audioFile, outputFile) {
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) throw new Error('FFmpeg missing');
+  const dest = videoFile === outputFile ? `${outputFile}.with-audio.mp4` : outputFile;
+  const run = (args) => {
+    execSync(`"${ffmpegPath}" ${args}`, {
+      encoding: 'utf8',
+      timeout: 300000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+  };
+  try {
+    run(`-hide_banner -y -i "${videoFile}" -i "${audioFile}" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ac 2 -ar 48000 -shortest -movflags +faststart "${dest}"`);
+  } catch (e) {
+    run(`-hide_banner -y -i "${videoFile}" -i "${audioFile}" -map 0:v:0 -map 1:a:0 -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 192k -ac 2 -ar 48000 -shortest -movflags +faststart "${dest}"`);
+  }
+  if (dest !== outputFile) {
+    try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) { /* ignore */ }
+    fs.renameSync(dest, outputFile);
+  }
+}
+
+function closeLoopbackWindow() {
+  if (loopbackWin && !loopbackWin.isDestroyed()) {
+    try { loopbackWin.close(); } catch (e) { /* ignore */ }
+  }
+  loopbackWin = null;
+}
+
+async function startLoopbackCapture(sessionFolder) {
+  await stopLoopbackCapture();
+  if (!settings.recordAudio) return { ok: false, error: 'audio off' };
+
+  const sources = await listCaptureSources();
+  const screen = sources.find((s) => s.id.startsWith('screen:')) || sources[0];
+  if (!screen) return { ok: false, error: 'No screen for audio' };
+
+  if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
+  loopbackFile = path.join(sessionFolder, 'loopback.webm');
+  loopbackBytes = 0;
+  loopbackReady = false;
+  loopbackStream = fs.createWriteStream(loopbackFile);
+
+  const audio = '1';
+  const ptt = settings.pttEnabled === true ? '1' : '0';
+  const url = `file://${path.join(__dirname, 'game-capture.html').replace(/\\/g, '/')}?mode=audio&sourceId=${encodeURIComponent(screen.id)}&screenId=${encodeURIComponent(screen.id)}&fps=30&audio=${audio}&ptt=${ptt}`;
+
+  loopbackWin = new BrowserWindow({
+    show: false,
+    width: 64,
+    height: 64,
+    skipTaskbar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'game-capture-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+      offscreen: false,
+      autoplayPolicy: 'no-user-gesture-required'
+    }
+  });
+  configureCaptureSession(loopbackWin, screen);
+
+  const ready = new Promise((resolve) => {
+    const t = setTimeout(() => {
+      cleanupReady();
+      resolve({ ok: false, error: 'Desktop audio timed out' });
+    }, 12000);
+    const onStarted = (_e, info) => {
+      clearTimeout(t);
+      cleanupReady();
+      resolve({ ok: true, info });
+    };
+    const onFailed = (_e, msg) => {
+      clearTimeout(t);
+      cleanupReady();
+      resolve({ ok: false, error: msg || 'Desktop audio failed' });
+    };
+    function cleanupReady() {
+      ipcMain.removeListener('loopback-started', onStarted);
+      ipcMain.removeListener('loopback-failed', onFailed);
+    }
+    ipcMain.once('loopback-started', onStarted);
+    ipcMain.once('loopback-failed', onFailed);
+  });
+
+  loopbackWin.loadURL(url);
+  const result = await ready;
+  if (!result.ok) {
+    await stopLoopbackCapture();
+    return result;
+  }
+  loopbackReady = true;
+  if (session) {
+    session.useLoopback = true;
+    session.audioOpened = Boolean(result.info && (result.info.loopback || result.info.mic || result.info.audio));
+  }
+  medal.hasLoopback = Boolean(result.info && result.info.loopback);
+  medal.hasMic = Boolean(result.info && result.info.mic);
+  medal.hasAudio = Boolean(result.info && result.info.audio);
+  console.log('Desktop loopback audio:', result.info);
+  return { ok: true, info: result.info };
+}
+
+async function stopLoopbackCapture() {
+  const file = loopbackFile;
+  if (loopbackWin && !loopbackWin.isDestroyed()) {
+    const stopped = new Promise((resolve) => {
+      const t = setTimeout(resolve, 2500);
+      ipcMain.once('loopback-stopped', () => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
+    try { loopbackWin.webContents.send('game-capture-stop'); } catch (e) { /* ignore */ }
+    await stopped;
+  }
+  closeLoopbackWindow();
+  await new Promise((r) => setTimeout(r, 150));
+  try {
+    if (loopbackStream) {
+      await new Promise((resolve) => loopbackStream.end(() => resolve()));
+    }
+  } catch (e) { /* ignore */ }
+  loopbackStream = null;
+  loopbackReady = false;
+  loopbackFile = file && fs.existsSync(file) && fs.statSync(file).size > 2048 ? file : null;
+  return loopbackFile;
+}
+
+ipcMain.on('loopback-audio-chunk', (_e, buf) => {
+  if (!loopbackStream || !buf) return;
+  try {
+    const data = Buffer.from(buf);
+    loopbackBytes += data.length;
+    loopbackStream.write(data);
+  } catch (e) {
+    console.error('loopback write failed:', e);
+  }
+});
 
 function nextSegmentPath() {
   session.segmentIndex += 1;
-  return path.join(session.folder, `segment-${session.segmentIndex}.mp4`);
+  return path.join(session.folder, `segment-${session.segmentIndex}.mkv`);
 }
 
 function currentSegmentPath() {
-  return path.join(session.folder, `segment-${session.segmentIndex}.mp4`);
+  return path.join(session.folder, `segment-${session.segmentIndex}.mkv`);
+}
+
+function existingSegmentPath(folder, index) {
+  const mkv = path.join(folder, `segment-${index}.mkv`);
+  const mp4 = path.join(folder, `segment-${index}.mp4`);
+  try {
+    if (fs.existsSync(mkv) && fs.statSync(mkv).size > 0) return mkv;
+  } catch (e) { /* ignore */ }
+  try {
+    if (fs.existsSync(mp4) && fs.statSync(mp4).size > 0) return mp4;
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+function sanitizeKnownGames(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const g of list) {
+    if (!g || typeof g !== 'object') continue;
+    const id = String(g.id || g.exe || g.title || '').trim().toLowerCase();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      title: String(g.title || id).slice(0, 120),
+      exe: g.exe ? String(g.exe).slice(0, 80) : '',
+      addedAt: Number(g.addedAt) || Date.now()
+    });
+    if (out.length >= 40) break;
+  }
+  return out;
+}
+
+function diskSpaceLimitBytes() {
+  return Math.min(4096, Math.max(200, Number(settings.diskSpaceLimitMb) || 500)) * 1024 * 1024;
+}
+
+function diskSpaceWarnBytes() {
+  const hard = diskSpaceLimitBytes();
+  return Math.max(hard * 3, hard + 1024 * 1024 * 1024);
+}
+
+function appendDiagnosticsLine(line) {
+  const text = `${new Date().toISOString()}  ${line}`;
+  console.log(line);
+  try { fs.appendFileSync(diagnosticsLogPath(), `${text}\n`, 'utf8'); } catch (e) { /* ignore */ }
+}
+
+function notifyUser(message) {
+  lastAppNotice = { message: String(message || ''), at: Date.now() };
+  try {
+    if (tray && !tray.isDestroyed()) {
+      tray.displayBalloon({ title: 'Ordinary Recorder', content: lastAppNotice.message });
+    }
+  } catch (e) { /* ignore */ }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('app-notice', lastAppNotice);
+    mainWindow.webContents.send('recording-state', getStatePayload());
+  }
+}
+
+function getFreeDiskBytesWmi(dir) {
+  const drive = String(path.resolve(dir || settings.outputFolder || 'C:\\')).slice(0, 2);
+  if (!/^[A-Za-z]:$/.test(drive)) return null;
+  try {
+    const r = spawnSync(
+      'powershell.exe',
+      ['-NoProfile', '-Command', `(Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${drive}'").FreeSpace`],
+      { encoding: 'utf8', timeout: 4000, windowsHide: true }
+    );
+    const n = Number(String(r.stdout || '').trim());
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getFreeDiskBytes(dir) {
+  const target = dir || settings.outputFolder || app.getPath('videos');
+  try {
+    if (typeof fs.statfsSync === 'function') {
+      const st = fs.statfsSync(target);
+      const bsize = Number(st.bsize || st.blockSize || 0);
+      const bavail = Number(st.bavail != null ? st.bavail : st.bfree);
+      if (bsize > 0 && bavail >= 0) return bsize * bavail;
+    }
+  } catch (e) { /* fall through */ }
+  return getFreeDiskBytesWmi(target);
+}
+
+function remuxCopyToMp4(inputFile, outputFile) {
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) throw new Error('FFmpeg not found');
+  const extra = [];
+  if (settings.videoCodec === 'hevc' || /\.hevc$/i.test(inputFile)) extra.push('-tag:v', 'hvc1');
+  try {
+    runFfmpegArgv(ffmpegPath, [
+      '-hide_banner', '-y', '-i', inputFile,
+      '-c', 'copy', ...extra, '-movflags', '+faststart', outputFile
+    ], 180000);
+  } catch (e) {
+    runFfmpegArgv(ffmpegPath, [
+      '-hide_banner', '-y', '-err_detect', 'ignore_err', '-i', inputFile,
+      '-c', 'copy', ...extra, '-movflags', '+faststart', outputFile
+    ], 180000);
+  }
+  if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size < 8192) {
+    throw new Error('Remux produced an empty file');
+  }
+}
+
+function mp4Beside(filePath) {
+  return String(filePath).replace(/\.(mkv|webm|ts|partial\.mkv)$/i, '.mp4');
+}
+
+function recoveredOutputName(kind) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return path.join(settings.outputFolder, `recovered-${kind}-${timestamp}.mp4`);
+}
+
+function siblingMp4Exists(filePath) {
+  const mp4 = mp4Beside(filePath);
+  try {
+    return mp4 !== filePath && fs.existsSync(mp4) && fs.statSync(mp4).size >= 8192;
+  } catch (e) {
+    return false;
+  }
+}
+
+function closeMedalPartialFiles() {
+  try { if (medal.partialFdV != null) fs.closeSync(medal.partialFdV); } catch (e) { /* ignore */ }
+  try { if (medal.partialFdA != null) fs.closeSync(medal.partialFdA); } catch (e) { /* ignore */ }
+  medal.partialFdV = null;
+  medal.partialFdA = null;
+}
+
+function deleteMedalPartialFiles() {
+  closeMedalPartialFiles();
+  for (const p of [medal.partialVideo, medal.partialAudio, medal.partialMeta, medal.workFile]) {
+    try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) { /* ignore */ }
+  }
+  medal.partialVideo = null;
+  medal.partialAudio = null;
+  medal.partialMeta = null;
+  medal.workFile = null;
+}
+
+function openMedalPartialFiles(base) {
+  closeMedalPartialFiles();
+  const ext = medal.rawFormat === 'hevc' ? '.hevc' : '.h264';
+  medal.partialVideo = `${base}${ext}`;
+  medal.partialAudio = `${base}.pcm`;
+  medal.partialMeta = `${base}.json`;
+  try {
+    fs.writeFileSync(medal.partialMeta, JSON.stringify({
+      fps: medal.fps || 30,
+      audioRate: medal.audioRate || 48000,
+      rawFormat: medal.rawFormat || 'h264',
+      startedAt: Date.now()
+    }), 'utf8');
+    medal.partialFdV = fs.openSync(medal.partialVideo, 'a');
+    medal.partialFdA = fs.openSync(medal.partialAudio, 'a');
+  } catch (e) {
+    console.warn('Could not open crash-safe spill files:', e.message || e);
+  }
+}
+
+function appendMedalPartial(kind, buf) {
+  try {
+    if (kind === 'video' && medal.partialFdV != null) fs.writeSync(medal.partialFdV, buf);
+    if (kind === 'audio' && medal.partialFdA != null) fs.writeSync(medal.partialFdA, buf);
+  } catch (e) { /* ignore */ }
+}
+
+function processNameForHwnd(hwnd) {
+  if (!hwnd) return '';
+  const id = String(hwnd).replace(/[^\d]/g, '');
+  if (!id) return '';
+  try {
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-Command', [
+      '$ErrorActionPreference="SilentlyContinue"',
+      'Add-Type @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public static class OrdPid {',
+      '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+      '}',
+      '"@',
+      `$pid = [uint32]0`,
+      `[void][OrdPid]::GetWindowThreadProcessId([IntPtr]${id}, [ref]$pid)`,
+      'if ($pid -gt 0) { (Get-Process -Id $pid).ProcessName }'
+    ].join('; ')], { encoding: 'utf8', timeout: 2500, windowsHide: true });
+    return String(r.stdout || '').trim().slice(0, 80);
+  } catch (e) {
+    return '';
+  }
+}
+
+function foregroundGameIdentity() {
+  const tops = queryTopWindows();
+  const fg = tops.find((w) => (
+    w.foreground &&
+    isGameLikeWindow(w.title) &&
+    !isFolderWindow(w.title)
+  ));
+  if (!fg) return null;
+  const exe = processNameForHwnd(fg.hwnd);
+  const id = (exe || String(fg.title || '').toLowerCase()).trim().toLowerCase();
+  if (!id) return null;
+  return { id, title: fg.title, exe };
+}
+
+function isKnownUnstableGame(ident) {
+  if (!ident) return false;
+  const games = settings.knownUnstableGames || [];
+  const exe = String(ident.exe || '').toLowerCase();
+  const id = String(ident.id || '').toLowerCase();
+  const title = String(ident.title || '').toLowerCase();
+  return games.some((g) => {
+    if (exe && g.exe && String(g.exe).toLowerCase() === exe) return true;
+    if (id && g.id && g.id === id) return true;
+    if (title && g.title && title.includes(String(g.title).toLowerCase()) && String(g.title).length > 3) return true;
+    return false;
+  });
+}
+
+function rememberUnstableGame(ident, reason) {
+  const info = ident || foregroundGameIdentity();
+  if (!info || !info.id) return;
+  if (isKnownUnstableGame(info)) return;
+  settings.knownUnstableGames = sanitizeKnownGames([
+    ...(settings.knownUnstableGames || []),
+    { id: info.id, title: info.title, exe: info.exe || '', addedAt: Date.now() }
+  ]);
+  saveSettings(settings);
+  appendDiagnosticsLine(
+    `Capture fallback remembered: skip ddagrab for "${info.exe || info.title}" (${reason || 'ddagrab failed'})`
+  );
+}
+
+function forgetUnstableGame(id) {
+  const key = String(id || '').toLowerCase();
+  settings.knownUnstableGames = (settings.knownUnstableGames || []).filter((g) => g.id !== key && String(g.exe || '').toLowerCase() !== key);
+  saveSettings(settings);
+  appendDiagnosticsLine(`Capture fallback cleared: ${key}`);
+  return { ok: true, knownUnstableGames: settings.knownUnstableGames };
+}
+
+function recoverOneContainer(inputFile, outputFile) {
+  remuxCopyToMp4(inputFile, outputFile);
+  try { fs.unlinkSync(inputFile); } catch (e) { /* keep source if delete fails */ }
+}
+
+function recoverAnnexbPair(videoFile, audioFile, metaFile, outputFile) {
+  let fps = 30;
+  let audioRate = 48000;
+  let raw = /\.hevc$/i.test(videoFile) ? 'hevc' : 'h264';
+  try {
+    if (metaFile && fs.existsSync(metaFile)) {
+      const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      fps = Number(meta.fps) || fps;
+      audioRate = Number(meta.audioRate) || audioRate;
+      if (meta.rawFormat === 'hevc') raw = 'hevc';
+    }
+  } catch (e) { /* ignore */ }
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const hasAudio = audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048;
+  const argv = ['-hide_banner', '-y', '-fflags', '+genpts', '-r', String(fps), '-f', raw, '-i', videoFile];
+  if (hasAudio) argv.push('-f', 's16le', '-ar', String(audioRate), '-ac', '2', '-i', audioFile, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-af', 'apad', '-shortest');
+  else argv.push('-c:v', 'copy', '-an');
+  argv.push('-f', 'matroska', outputFile.replace(/\.mp4$/i, '.mkv'));
+  const mkv = outputFile.replace(/\.mp4$/i, '.mkv');
+  runFfmpegArgv(ffmpegPath, argv, 180000);
+  remuxCopyToMp4(mkv, outputFile);
+  try { fs.unlinkSync(mkv); } catch (e) { /* ignore */ }
+  for (const p of [videoFile, audioFile, metaFile]) {
+    try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) { /* ignore */ }
+  }
+}
+
+function recoverCrashedRecordings() {
+  const recovered = [];
+  const folder = settings.outputFolder;
+  if (!folder || !fs.existsSync(folder) || !ffmpegCaps.available) return recovered;
+
+  const consider = [];
+  try {
+    for (const name of fs.readdirSync(folder)) {
+      if (!name || name.startsWith('.')) continue;
+      const full = path.join(folder, name);
+      consider.push({ name, full });
+    }
+  } catch (e) {
+    return recovered;
+  }
+
+  for (const item of consider) {
+    try {
+      const st = fs.statSync(item.full);
+      if (!st.isFile() || st.size < 8192) continue;
+      if (siblingMp4Exists(item.full)) {
+        if (/\.(mkv|partial\.mkv)$/i.test(item.name)) {
+          try { fs.unlinkSync(item.full); } catch (e) { /* ignore */ }
+        }
+        continue;
+      }
+      if (/\.partial\.(h264|hevc)$/i.test(item.name)) {
+        const base = item.full.replace(/\.partial\.(h264|hevc)$/i, '.partial');
+        const out = recoveredOutputName('recording');
+        recoverAnnexbPair(
+          item.full,
+          `${base}.pcm`,
+          `${base}.json`,
+          out
+        );
+        recovered.push(out);
+        continue;
+      }
+      if (/\.(mkv)$/i.test(item.name) || (/^recording-.*\.webm$/i.test(item.name))) {
+        const out = mp4Beside(item.full);
+        recoverOneContainer(item.full, out);
+        recovered.push(out);
+      }
+    } catch (e) {
+      console.warn('Could not recover', item.name, e.message || e);
+    }
+  }
+
+  try {
+    for (const name of fs.readdirSync(folder)) {
+      if (!name.startsWith('.session-')) continue;
+      const dir = path.join(folder, name);
+      let st;
+      try { st = fs.statSync(dir); } catch (e) { continue; }
+      if (!st.isDirectory()) continue;
+      const segs = fs.readdirSync(dir)
+        .filter((n) => /^segment-\d+\.(mkv|mp4)$/i.test(n))
+        .map((n) => path.join(dir, n))
+        .filter((p) => {
+          try { return fs.statSync(p).size > 1024; } catch (e) { return false; }
+        })
+        .sort();
+      if (segs.length) {
+        const out = recoveredOutputName('recording');
+        try {
+          concatSegments(segs, out, dir);
+          recovered.push(out);
+        } catch (e) {
+          console.warn('Session concat failed, remuxing largest segment:', e.message || e);
+          try {
+            const biggest = segs.slice().sort((a, b) => fs.statSync(b).size - fs.statSync(a).size)[0];
+            recoverOneContainer(biggest, out);
+            recovered.push(out);
+          } catch (e2) {
+            console.warn('Session remux failed:', e2.message || e2);
+          }
+        }
+      }
+      rmSessionFolder(dir);
+    }
+  } catch (e) {
+    console.warn('Session folder recovery failed:', e.message || e);
+  }
+
+  try {
+    const bufDir = getReplayBufferDir();
+    if (fs.existsSync(bufDir)) {
+      const snap = path.join(bufDir, 'medal-snapshot.mkv');
+      if (fs.existsSync(snap) && fs.statSync(snap).size >= 8192) {
+        const out = recoveredOutputName('replay');
+        recoverOneContainer(snap, out);
+        recovered.push(out);
+      }
+      const parts = fs.readdirSync(bufDir)
+        .filter((n) => /^buffer_\d+\.(mkv|ts|mp4)$/i.test(n))
+        .map((n) => path.join(bufDir, n))
+        .filter((p) => {
+          try { return fs.statSync(p).size > 1024; } catch (e) { return false; }
+        });
+      if (parts.length >= 2 || (parts.length === 1 && fs.statSync(parts[0]).size > 64 * 1024)) {
+        const out = recoveredOutputName('replay');
+        try {
+          concatSegments(parts.sort(), out, bufDir);
+          recovered.push(out);
+          for (const p of parts) {
+            try { fs.unlinkSync(p); } catch (e) { /* ignore */ }
+          }
+        } catch (e) {
+          console.warn('Replay concat failed, remuxing largest segment:', e.message || e);
+          try {
+            const biggest = parts.slice().sort((a, b) => fs.statSync(b).size - fs.statSync(a).size)[0];
+            recoverOneContainer(biggest, out);
+            recovered.push(out);
+          } catch (e2) {
+            console.warn('Replay remux failed:', e2.message || e2);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Replay buffer recovery failed:', e.message || e);
+  }
+
+  return recovered.filter((p) => {
+    try { return fs.existsSync(p) && fs.statSync(p).size >= 8192; } catch (e) { return false; }
+  });
+}
+
+function maybeSpillMedalSnapshot() {
+  const now = Date.now();
+  if (now - medalSpillAt < 8000) return;
+  medalSpillAt = now;
+  const video = medal.recording ? medal.sessionVideo : medal.video;
+  const audio = medal.recording ? medal.sessionAudio : medal.audio;
+  if (!video || !video.length) return;
+  setImmediate(() => {
+    try {
+      const dest = medal.recording && medal.workFile
+        ? medal.workFile
+        : path.join(getReplayBufferDir(), 'medal-snapshot.mkv');
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      muxMedalMp4(video, audio, dest, medal.fps || 30);
+    } catch (e) {
+      console.warn('Medal snapshot spill failed:', e.message || e);
+    }
+  });
+}
+
+async function checkDiskSpaceGuard() {
+  const free = getFreeDiskBytes();
+  if (free == null) return;
+  lastDiskFreeBytes = free;
+  const active = isRecording || instantReplayActive || medal.active || Boolean(replayProcess);
+  if (!active) {
+    if (lastDiskWarning) {
+      lastDiskWarning = null;
+      broadcastState();
+    }
+    return;
+  }
+  const hard = diskSpaceLimitBytes();
+  const warn = diskSpaceWarnBytes();
+  let level = null;
+  if (free <= hard) level = 'critical';
+  else if (free <= warn) level = 'low';
+  if (level !== lastDiskWarning) {
+    lastDiskWarning = level;
+    broadcastState();
+  }
+  if (level !== 'critical' || diskStopInFlight) return;
+  diskStopInFlight = true;
+  try {
+    if (isRecording) {
+      notifyUser('Recording stopped — disk space low');
+      await stopRecording();
+    } else if (settings.instantReplayEnabled && (instantReplayActive || replayProcess || medal.active)) {
+      try { await saveInstantReplay(); } catch (e) { /* recover leftover mkv on next launch if save fails */ }
+      try { await toggleInstantReplay(false); } catch (e) { /* ignore */ }
+      notifyUser('Replay buffer stopped — disk space low');
+    }
+  } catch (e) {
+    console.error('Disk-space stop failed:', e);
+  } finally {
+    diskStopInFlight = false;
+    lastDiskWarning = null;
+    broadcastState();
+  }
+}
+
+function startDiskSpacePolling() {
+  if (diskPollTimer) return;
+  checkDiskSpaceGuard().catch((e) => console.warn('disk guard:', e.message || e));
+  diskPollTimer = setInterval(() => {
+    checkDiskSpaceGuard().catch((e) => console.warn('disk guard:', e.message || e));
+  }, 8000);
 }
 
 function launchSegment() {
@@ -1134,7 +2754,8 @@ function launchSegment() {
     useDdagrab: session.useDdagrab,
     useAmf: session.useAmf,
     audioDevice: session.audioDevice,
-    useWasapi: session.useWasapi
+    micDevice: session.micDevice,
+    useWasapi: session.useWasapi && ffmpegCaps.hasWasapi
   });
 
   let fallbackStage = 0;
@@ -1159,6 +2780,9 @@ function launchSegment() {
     const msg = data.toString();
     stderrBuf += msg;
     handleFfmpegProgress(msg);
+    if (session && /Audio:\s*aac|Stream #1:0.*Audio/i.test(msg)) {
+      session.audioOpened = true;
+    }
 
     // Keep console quieter — only log real problems
     if (/error|fail|invalid|could not/i.test(msg)) console.error(msg);
@@ -1168,16 +2792,49 @@ function launchSegment() {
     if (session.useWasapi && isAudioFailure(msg)) {
       fallbackStage = 1;
       console.warn('WASAPI loopback failed; retrying DirectShow audio.');
+      appendDiagnosticsLine('Audio: WASAPI failed, falling back to DirectShow');
       session.useWasapi = false;
+      try {
+        const devices = listDshowAudioDevices();
+        const next = resolveAudioDevice(devices);
+        session.audioDevice = next;
+        if (next) settings.audioDevice = next;
+        session.micDevice = session.micDevice || pickMicrophoneDevice(devices);
+        notifyUser(next
+          ? `WASAPI loopback failed — switched to ${next}`
+          : 'WASAPI loopback failed — game audio may be silent');
+      } catch (e) { /* ignore */ }
       restartCurrentSegment();
       return;
     }
 
     if (session.audioDevice && isAudioFailure(msg)) {
       fallbackStage = 1;
+      try {
+        const devices = listDshowAudioDevices();
+        const next = resolveAudioDevice(devices);
+        if (next && next !== session.audioDevice) {
+          console.warn('Audio device failed; switching to', next);
+          applyAudioDeviceChange(`ffmpeg lost ${session.audioDevice}`, next);
+          return;
+        }
+      } catch (e) { /* ignore */ }
       console.warn('Audio device failed; retrying without audio.');
+      appendDiagnosticsLine(`Audio: dropped ${session.audioDevice} after ffmpeg error`);
       session.audioDevice = null;
+      session.micDevice = null;
+      session.audioDropped = true;
+      session.audioOpened = false;
+      notifyUser('Audio source dropped — recording continues without that device');
       restartCurrentSegment();
+      return;
+    }
+
+    if (session.useDdagrab && isExclusiveFullscreenCaptureFailure(msg)) {
+      fallbackStage = 1;
+      console.warn('Fullscreen blocked desktop duplication; switching to game capture.');
+      rememberUnstableGame(foregroundGameIdentity(), 'ddagrab exclusive-fullscreen failure');
+      try { sendQuit(ffmpegProcess); } catch (e) { /* ignore */ }
       return;
     }
 
@@ -1193,10 +2850,11 @@ function launchSegment() {
       return;
     }
 
-    if (session.useAmf && isAmfFailure(msg)) {
+    if (session.useAmf && isSelectedHwFailure(msg)) {
       fallbackStage = 1;
       // gameMode: first retry AMF with nv12 download if hw passthrough failed
       if (
+        isAmfFailure(msg) &&
         settings.gameMode &&
         session.useDdagrab &&
         !session.forceAmfDownload &&
@@ -1207,7 +2865,7 @@ function launchSegment() {
         restartCurrentSegment();
         return;
       }
-      console.warn('AMF encoder failed; falling back to libx264.');
+      console.warn('Hardware encoder failed; falling back to libx264.');
       session.useAmf = false;
       session.forceAmfDownload = true;
       restartCurrentSegment();
@@ -1244,8 +2902,9 @@ function launchSegment() {
         launchSegment();
         return;
       }
-      if (session.useAmf && isAmfFailure(msg)) {
+      if (session.useAmf && isSelectedHwFailure(msg)) {
         if (
+          isAmfFailure(msg) &&
           settings.gameMode &&
           session.useDdagrab &&
           !session.forceAmfDownload &&
@@ -1267,12 +2926,15 @@ function launchSegment() {
       }
       if (session.audioDevice && isAudioFailure(msg)) {
         session.audioDevice = null;
+        session.micDevice = null;
+        session.audioDropped = true;
+        session.audioOpened = false;
         launchSegment();
         return;
       }
     }
 
-    if (intent === 'pausing' || intent === 'stopping') {
+    if (intent === 'pausing' || intent === 'stopping' || intent === 'switching') {
       if (outputFile && fs.existsSync(outputFile) && !session.segments.includes(outputFile)) {
         try {
           if (fs.statSync(outputFile).size > 0) session.segments.push(outputFile);
@@ -1283,6 +2945,13 @@ function launchSegment() {
 
   // Unexpected exit while supposedly recording
     if (isRecording && !isPaused && intent === 'running') {
+      const failMsg = stderrBuf || '';
+      if (isExclusiveFullscreenCaptureFailure(failMsg) && !usingGameCapture) {
+        console.warn('Desktop duplication blocked by fullscreen. Switching to game capture.');
+        rememberUnstableGame(foregroundGameIdentity(), 'ddagrab exited — switching to WGC');
+        switchDesktopRecordingToGame().catch((e) => console.error('game capture fallback failed:', e));
+        return;
+      }
       console.error('ffmpeg exited unexpectedly while recording, code=', code);
       console.error(stderrBuf.slice(-1500));
       isRecording = false;
@@ -1337,24 +3006,140 @@ function getReplayBufferDir() {
 }
 
 function getReplayWrapCount() {
-  const minutes = Math.min(5, Math.max(1, Number(settings.instantReplayMinutes) || 5));
+  const cap = maxReplayMinutesForRam();
+  const minutes = Math.min(cap, Math.max(1, Number(settings.instantReplayMinutes) || 5));
   return Math.ceil((minutes * 60) / REPLAY_SEGMENT_SECONDS);
+}
+
+function pruneReplayBookmarks() {
+  const minutes = Math.min(5, Number(settings.instantReplayMinutes) || 5);
+  const oldest = Date.now() - minutes * 60 * 1000 - 5000;
+  replayBookmarks = (replayBookmarks || []).filter((b) => Number(b.at) >= oldest);
+  return replayBookmarks;
+}
+
+function markReplayBookmark() {
+  const live = Boolean(settings.instantReplayEnabled && (medal.active || instantReplayActive || replayProcess));
+  if (!live) {
+    playCue('fail');
+    return { ok: false, error: 'Instant Replay is not active' };
+  }
+  pruneReplayBookmarks();
+  replayBookmarks.push({ at: Date.now() });
+  playCue('bookmark');
+  broadcastState();
+  return { ok: true, count: replayBookmarks.length };
+}
+
+function bookmarksInRange(saveMinutes, endedAt) {
+  const end = Number(endedAt) || Date.now();
+  const span = Math.max(30, Math.round(Number(saveMinutes) * 60)) * 1000;
+  const start = end - span;
+  return pruneReplayBookmarks()
+    .filter((b) => b.at >= start && b.at <= end)
+    .map((b, i) => ({
+      index: i + 1,
+      at: b.at,
+      seconds: Math.max(0, (b.at - start) / 1000)
+    }));
+}
+
+function writeReplayBookmarkSidecar(outputFile, marks, saveMinutes) {
+  const payload = {
+    type: 'ordinary-recorder-bookmarks',
+    file: path.basename(outputFile),
+    saveMinutes,
+    createdAt: new Date().toISOString(),
+    bookmarks: marks
+  };
+  const jsonPath = outputFile.replace(/\.[^.]+$/i, '.json');
+  fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2), 'utf8');
+  return jsonPath;
+}
+
+function embedReplayChapters(outputFile, marks) {
+  if (!marks.length) return false;
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) return false;
+  const meta = path.join(path.dirname(outputFile), `.chapters-${Date.now()}.txt`);
+  const tmp = `${outputFile}.chapters.mp4`;
+  const lines = [';FFMETADATA1'];
+  for (const m of marks) {
+    const start = Math.max(0, Math.round(m.seconds * 1000));
+    const end = start + 1000;
+    lines.push('[CHAPTER]', 'TIMEBASE=1/1000', `START=${start}`, `END=${end}`, `title=Bookmark ${m.index}`, '');
+  }
+  try {
+    fs.writeFileSync(meta, lines.join('\n'), 'utf8');
+    runFfmpegArgv(ffmpegPath, [
+      '-hide_banner', '-y', '-i', outputFile, '-i', meta,
+      '-map_metadata', '1', '-codec', 'copy', tmp
+    ], 120000);
+    if (fs.existsSync(tmp) && fs.statSync(tmp).size >= 8192) {
+      try { fs.unlinkSync(outputFile); } catch (e) { /* ignore */ }
+      fs.renameSync(tmp, outputFile);
+      return true;
+    }
+  } catch (e) {
+    console.warn('Chapter embed failed:', e.message || e);
+  } finally {
+    try { if (fs.existsSync(meta)) fs.unlinkSync(meta); } catch (e) { /* ignore */ }
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e) { /* ignore */ }
+  }
+  return false;
+}
+
+function attachReplayBookmarks(outputFile, saveMinutes, endedAt) {
+  const marks = bookmarksInRange(saveMinutes, endedAt);
+  if (!marks.length) return { sidecar: null, chapters: false, bookmarks: [] };
+  let sidecar = null;
+  try { sidecar = writeReplayBookmarkSidecar(outputFile, marks, saveMinutes); } catch (e) {
+    console.warn('Bookmark sidecar failed:', e.message || e);
+  }
+  const chapters = embedReplayChapters(outputFile, marks);
+  return { sidecar, chapters, bookmarks: marks };
+}
+
+async function waitReplayFilesStable(tries = 6) {
+  let prev = '';
+  for (let i = 0; i < tries; i++) {
+    const cur = listReplayBufferFilesDetailed().map((f) => `${f.name}:${f.size}`).join('|');
+    if (cur && cur === prev) return;
+    prev = cur;
+    await new Promise((r) => setTimeout(r, 120));
+  }
 }
 
 function getInstantReplayState() {
   const files = listReplayBufferFilesDetailed();
   const medalSeconds = medalVideoSeconds();
   const medalOn = Boolean(medal.active);
+  const maxMinutes = maxReplayMinutesForRam();
+  const minutes = Math.min(maxMinutes, Math.min(5, Number(settings.instantReplayMinutes) || 5));
+  const wrap = getReplayWrapCount();
+  const capacitySec = minutes * 60;
+  const bufferSeconds = medalOn ? medalSeconds : files.length * REPLAY_SEGMENT_SECONDS;
+  const fillPercent = capacitySec > 0 ? Math.max(0, Math.min(100, Math.round((bufferSeconds / capacitySec) * 100))) : 0;
+  pruneReplayBookmarks();
   return {
     enabled: Boolean(settings.instantReplayEnabled),
     active: Boolean(settings.instantReplayEnabled && (medalOn || instantReplayActive || replayProcess)),
-    minutes: Math.min(5, Number(settings.instantReplayMinutes) || 5),
+    minutes,
+    maxMinutes,
+    estimatedRamBytes: estimateReplayRamBytes({ minutes }),
     saveMinutes: Number(settings.instantReplaySaveMinutes) || 2,
     fps: Number(settings.instantReplayFps) || 30,
     pausedForRecording: replayPausedForRecording,
     bufferDir: getReplayBufferDir(),
     bufferFiles: medalOn ? medal.video.length : files.length,
-    bufferSeconds: medalOn ? medalSeconds : files.length * REPLAY_SEGMENT_SECONDS
+    bufferSeconds,
+    wrapCount: wrap,
+    fillPercent,
+    lastSaveOk: lastReplaySave.ok,
+    lastSaveAt: lastReplaySave.at,
+    lastSaveError: lastReplaySave.error,
+    lastSaveFile: lastReplaySave.file,
+    bookmarkCount: replayBookmarks.length
   };
 }
 
@@ -1375,7 +3160,7 @@ function buildReplayArgs(bufferPattern) {
     '-f', 'segment',
     '-segment_time', String(REPLAY_SEGMENT_SECONDS),
     '-segment_wrap', String(wrap),
-    '-segment_format', 'mpegts',
+    '-segment_format', 'matroska',
     '-reset_timestamps', '1',
     '-strftime', '0',
     bufferPattern
@@ -1388,7 +3173,7 @@ function listReplayBufferFilesDetailed() {
   const dir = getReplayBufferDir();
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir)
-    .filter((name) => /^buffer_\d+\.(ts|mp4)$/i.test(name))
+    .filter((name) => /^buffer_\d+\.(ts|mp4|mkv)$/i.test(name))
     .map((name) => {
       const full = path.join(dir, name);
       let mtime = 0;
@@ -1408,10 +3193,22 @@ function listReplayBufferFiles() {
   return listReplayBufferFilesDetailed().map((f) => f.full);
 }
 
-/** Take only the last N minutes (by mtime order / segment count). */
+/** Take only the last N minutes (by mtime order / segment count). Skip wrap stubs. */
 function selectReplaySegmentsForSave(saveMinutes) {
-  const all = listReplayBufferFilesDetailed();
+  let all = listReplayBufferFilesDetailed();
   if (!all.length) return [];
+  if (all.length >= 2) {
+    const newest = all[all.length - 1];
+    const prev = all[all.length - 2];
+    if (newest.size < Math.max(8 * 1024, prev.size * 0.15)) {
+      all = all.slice(0, -1);
+    }
+  }
+  if (all.length >= 3) {
+    const sizes = all.map((f) => f.size).slice().sort((a, b) => a - b);
+    const med = sizes[Math.floor(sizes.length / 2)] || 0;
+    if (med > 0 && all[0].size < med * 0.2) all = all.slice(1);
+  }
   const seconds = Math.max(30, Math.round(Number(saveMinutes) * 60)) || 300;
   const need = Math.max(1, Math.ceil(seconds / REPLAY_SEGMENT_SECONDS));
   return all.slice(-need).map((f) => f.full);
@@ -1421,7 +3218,7 @@ function clearReplayBufferFiles() {
   const dir = getReplayBufferDir();
   if (!fs.existsSync(dir)) return;
   for (const name of fs.readdirSync(dir)) {
-    if (/^buffer_\d+\.(ts|mp4)$/i.test(name) || name === 'replay-concat.txt') {
+    if (/^buffer_\d+\.(ts|mp4|mkv)$/i.test(name) || name === 'replay-concat.txt' || name === 'medal-snapshot.mkv') {
       try { fs.unlinkSync(path.join(dir, name)); } catch (e) { /* ignore */ }
     }
   }
@@ -1446,11 +3243,10 @@ function startReplayProcess({ clearBuffer = false } = {}) {
   if (clearBuffer) clearReplayBufferFiles();
 
   replayUseDdagrab = ffmpegCaps.hasDdagrab;
-  // Prefer working H.264 AMF — HEVC AMF often fails at runtime on consumer GPUs
-  replayUseAmf = Boolean(ffmpegCaps.hasH264Amf || ffmpegCaps.hasHevcAmf);
+  replayUseAmf = pickActiveEncoder({ hardware: true }).hardware;
 
-  // MPEG-TS segments — reliable rolling buffer
-  const pattern = path.join(dir, 'buffer_%03d.ts');
+  // Matroska segments — crash-recoverable rolling buffer (remuxed to mp4 on save / launch)
+  const pattern = path.join(dir, 'buffer_%03d.mkv');
   const args = buildReplayArgs(pattern);
   const ffmpegPath = ffmpegCaps.path;
 
@@ -1489,7 +3285,7 @@ function startReplayProcess({ clearBuffer = false } = {}) {
       }, 2000);
       return;
     }
-    if (replayUseAmf && isAmfFailure(msg)) {
+    if (replayUseAmf && isSelectedHwFailure(msg)) {
       fallbackStage = 1;
       replayUseAmf = false;
       restartReplayProcess();
@@ -1514,7 +3310,7 @@ function startReplayProcess({ clearBuffer = false } = {}) {
     if (settings.instantReplayEnabled && !replayPausedForRecording && code && code !== 0 && fallbackStage === 0) {
       const msg = stderrBuf;
       console.error('Replay ffmpeg exited:', code, msg.slice(-500));
-      if (replayUseAmf && isAmfFailure(msg)) {
+      if (replayUseAmf && isSelectedHwFailure(msg)) {
         replayUseAmf = false;
         startReplayProcess({ clearBuffer: false });
         return;
@@ -1541,7 +3337,18 @@ function scheduleReplayAutoRestart(reason) {
     updateTrayMenu();
     return;
   }
-  const lostDisplay = /887a0026|887a0027|AcquireNextFrame|ddagrab|exit-1|exit-224/i.test(String(reason || ''));
+  const exclusiveFail = /Selected output not supported|887a0026|887a0027|Failed to configure output pad|AcquireNextFrame/i.test(String(reason || ''));
+  if (exclusiveFail) {
+    console.warn('Instant Replay waiting — exclusive fullscreen blocks desktop duplication.');
+    setTimeout(() => {
+      if (!settings.instantReplayEnabled || isRecording || replayProcess || replayPausedForRecording) return;
+      startReplayProcess({ clearBuffer: false });
+    }, 15000);
+    broadcastState();
+    updateTrayMenu();
+    return;
+  }
+  const lostDisplay = /ddagrab|exit-1|exit-224/i.test(String(reason || ''));
   if (!lostDisplay && replayCrashCount >= 8) {
     console.error('Replay auto-restart limit reached:', reason);
     broadcastState();
@@ -1644,6 +3451,7 @@ async function toggleInstantReplay(enable) {
 
 async function saveInstantReplay(saveMinutesOverride) {
   if (!settings.instantReplayEnabled && !medal.active && !instantReplayActive && !replayProcess) {
+    playCue('fail');
     return { ok: false, error: 'Instant Replay is not active — turn it ON and wait for the buffer to fill' };
   }
 
@@ -1665,13 +3473,17 @@ async function saveInstantReplay(saveMinutesOverride) {
     await waitForProcessClose(proc, 25000);
     replayProcess = null;
     instantReplayActive = false;
-    // Give Windows a moment to flush file handles
     await new Promise((r) => setTimeout(r, 400));
+    await waitReplayFilesStable();
   }
+
+  const saveEndedAt = Date.now();
 
   let segments = selectReplaySegmentsForSave(saveMinutes);
   if (!segments.length) {
     if (settings.instantReplayEnabled) startReplayProcess({ clearBuffer: false });
+    lastReplaySave = { ok: false, at: Date.now(), error: 'empty', file: null };
+    playCue('fail');
     return {
       ok: false,
       error: 'Replay buffer is empty — leave Instant Replay ON for at least ~15–30 seconds, then try again'
@@ -1739,18 +3551,24 @@ async function saveInstantReplay(saveMinutesOverride) {
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch (e2) { /* ignore */ }
     if (settings.instantReplayEnabled) startReplayProcess({ clearBuffer: false });
     const detail = (e.stderr && String(e.stderr).slice(-300)) || e.message || String(e);
+    lastReplaySave = { ok: false, at: Date.now(), error: detail, file: null };
+    playCue('fail');
     return { ok: false, error: `Save failed: ${detail}` };
   }
 
   try { fs.rmSync(staging, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+
+  const marks = attachReplayBookmarks(outputFile, saveMinutes, saveEndedAt);
 
   // Keep buffering — do not delete segment files
   if (settings.instantReplayEnabled && !isRecording) {
     startReplayProcess({ clearBuffer: false });
   }
 
+  lastReplaySave = { ok: true, at: Date.now(), error: null, file: outputFile };
+  playCue('saved');
   broadcastState();
-  return { ok: true, file: outputFile, segments: segments.length, saveMinutes };
+  return { ok: true, file: outputFile, segments: segments.length, saveMinutes, bookmarks: marks.bookmarks };
 }
 
 function setPttHeld(held) {
@@ -1900,9 +3718,12 @@ function muxMedalMp4(videoChunks, audioChunks, outputFile, fps) {
     const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
     const rate = fps || 30;
     const audioRate = medal.audioRate || 48000;
+    const raw = medal.rawFormat === 'hevc' ? 'hevc' : 'h264';
+    const isMp4 = /\.mp4$/i.test(outputFile);
+    const tail = isMp4 ? `-movflags +faststart "${outputFile}"` : `-f matroska "${outputFile}"`;
     const cmd = hasAudio
-      ? `"${ffmpegPath}" -hide_banner -y -fflags +genpts -r ${rate} -f h264 -i "${vfile}" -f s16le -ar ${audioRate} -ac 2 -i "${afile}" -c:v copy -c:a aac -b:a 192k -af apad -shortest -movflags +faststart "${outputFile}"`
-      : `"${ffmpegPath}" -hide_banner -y -fflags +genpts -r ${rate} -f h264 -i "${vfile}" -c:v copy -an -movflags +faststart "${outputFile}"`;
+      ? `"${ffmpegPath}" -hide_banner -y -fflags +genpts -r ${rate} -f ${raw} -i "${vfile}" -f s16le -ar ${audioRate} -ac 2 -i "${afile}" -c:v copy -c:a aac -b:a 192k -af apad -shortest ${tail}`
+      : `"${ffmpegPath}" -hide_banner -y -fflags +genpts -r ${rate} -f ${raw} -i "${vfile}" -c:v copy -an ${tail}`;
     execSync(cmd, {
       encoding: 'utf8',
       timeout: 180000,
@@ -2014,10 +3835,12 @@ async function startMedalEngineLocked(retarget) {
 
   const fps = 30;
   medal.fps = fps;
+  medal.rawFormat = webCodecsCodecParam() === 'hevc' ? 'hevc' : 'h264';
   const audio = settings.recordAudio ? '1' : '0';
   const ptt = settings.pttEnabled === true ? '1' : '0';
-  const bitrate = settings.spaceSaving ? 6_000_000 : 8_000_000;
-  const url = `file://${path.join(__dirname, 'game-capture.html').replace(/\\/g, '/')}?mode=medal&sourceId=${encodeURIComponent(source.id)}&screenId=${encodeURIComponent(screenId)}&fps=${fps}&audio=${audio}&ptt=${ptt}&bitrate=${bitrate}`;
+  const bitrate = captureBitrateBps({ forReplay: true });
+  const pixels = capturePixelSize();
+  const url = `file://${path.join(__dirname, 'game-capture.html').replace(/\\/g, '/')}?mode=medal&sourceId=${encodeURIComponent(source.id)}&screenId=${encodeURIComponent(screenId)}&fps=${fps}&audio=${audio}&ptt=${ptt}&bitrate=${bitrate}&codec=${encodeURIComponent(medal.rawFormat)}&hw=1&maxWidth=${pixels.width}&maxHeight=${pixels.height}`;
 
   closeGameCaptureWindow();
   gameCaptureWin = new BrowserWindow({
@@ -2076,6 +3899,7 @@ async function startMedalEngineLocked(retarget) {
   medal.hasLoopback = Boolean(result.info && result.info.loopback);
   medal.hasMic = Boolean(result.info && result.info.mic);
   medal.audioRate = Number(result.info && result.info.sampleRate) || 48000;
+  medal.rawFormat = /hvc1|hev1|hevc/i.test(String((result.info && result.info.codec) || '')) ? 'hevc' : 'h264';
   medal.startedAt = Date.now();
   medal.video = [];
   medal.audio = [];
@@ -2106,6 +3930,7 @@ async function stopMedalEngine({ force = false } = {}) {
   medal.hasAudio = false;
   medal.hasLoopback = false;
   medal.hasMic = false;
+  closeMedalPartialFiles();
   if (!isRecording) stopPowerSave();
   broadcastState();
   updateTrayMenu();
@@ -2130,6 +3955,9 @@ function beginMedalSession() {
   startStatsPolling();
   updateTrayMenu();
   broadcastState();
+  playCue('start');
+  medal.workFile = path.join(settings.outputFolder, `recording-${timestamp}.partial.mkv`);
+  openMedalPartialFiles(path.join(settings.outputFolder, `recording-${timestamp}.partial`));
   return { ok: true, file: currentOutputFile, mode: 'medal' };
 }
 
@@ -2143,14 +3971,30 @@ async function stopMedalRecording() {
   const audio = medal.sessionAudio.slice();
   medal.sessionVideo = [];
   medal.sessionAudio = [];
+  closeMedalPartialFiles();
   const out = currentOutputFile;
+  const work = medal.workFile || out.replace(/\.mp4$/i, '.partial.mkv');
   let error = null;
   let finalSize = 0;
   try {
-    muxMedalMp4(video, audio, out, medal.fps || 30);
+    muxMedalMp4(video, audio, work, medal.fps || 30);
+    remuxCopyToMp4(work, out);
+    try { if (fs.existsSync(work)) fs.unlinkSync(work); } catch (e) { /* ignore */ }
+    deleteMedalPartialFiles();
     finalSize = fs.existsSync(out) ? fs.statSync(out).size : 0;
   } catch (e) {
     error = e.message || String(e);
+    try {
+      if (work && fs.existsSync(work) && fs.statSync(work).size >= 8192) {
+        remuxCopyToMp4(work, out);
+        error = null;
+        finalSize = fs.statSync(out).size;
+        try { fs.unlinkSync(work); } catch (e2) { /* ignore */ }
+        deleteMedalPartialFiles();
+      }
+    } catch (e2) {
+      error = e2.message || String(e2);
+    }
   }
 
   isPaused = false;
@@ -2178,19 +4022,27 @@ async function stopMedalRecording() {
 async function saveMedalReplay(saveMinutes) {
   const { video, audio } = sliceMedalReplay(saveMinutes);
   if (!video.length) {
+    lastReplaySave = { ok: false, at: Date.now(), error: 'empty', file: null };
+    playCue('fail');
     return { ok: false, error: 'Replay buffer is empty — leave Instant Replay ON for ~15 seconds, then clip' };
   }
   if (!fs.existsSync(settings.outputFolder)) fs.mkdirSync(settings.outputFolder, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const label = saveMinutes < 1 ? '30s' : `${saveMinutes}min`;
   const outputFile = path.join(settings.outputFolder, `replay-${label}-${timestamp}.mp4`);
+  const saveEndedAt = Date.now();
   try {
     muxMedalMp4(video, audio, outputFile, medal.fps || 30);
   } catch (e) {
+    lastReplaySave = { ok: false, at: Date.now(), error: e.message || String(e), file: null };
+    playCue('fail');
     return { ok: false, error: `Save failed: ${e.message || e}` };
   }
+  const marks = attachReplayBookmarks(outputFile, saveMinutes, saveEndedAt);
+  lastReplaySave = { ok: true, at: Date.now(), error: null, file: outputFile };
+  playCue('saved');
   broadcastState();
-  return { ok: true, file: outputFile, segments: video.length, saveMinutes };
+  return { ok: true, file: outputFile, segments: video.length, saveMinutes, bookmarks: marks.bookmarks };
 }
 
 // ---------- Game / exclusive-fullscreen capture (Chromium WGC) ----------
@@ -2334,54 +4186,37 @@ function gameWindowScore(name, top) {
   return score;
 }
 
-function pickGameCaptureSource(sources, currentId) {
-  const screens = sources.filter((s) => s.id.startsWith('screen:'));
+/** Exclusive / borderless-fullscreen games are not on the desktop compositor. */
+function findExclusiveGameWindow(sources) {
+  if (settings.exclusiveFullscreen === false) return null;
   const windows = sources.filter((s) => s.id.startsWith('window:'));
   const usableWindows = windows.filter((s) => s.name && !SKIP_CAPTURE_WINDOWS.test(s.name) && !isFolderWindow(s.name));
   const gameWindows = usableWindows.filter((s) => isGameLikeWindow(s.name));
   const tops = queryTopWindows();
-  const fg = tops.find((w) => w.foreground && isGameLikeWindow(w.title) && !isFolderWindow(w.title));
+  const fg = tops.find((w) => (
+    w.foreground &&
+    isGameLikeWindow(w.title) &&
+    !isFolderWindow(w.title) &&
+    isRectFullscreen(w)
+  ));
+  if (!fg) return null;
+  const hit = matchSourceToWindow(gameWindows.length ? gameWindows : usableWindows, fg.hwnd, fg.title);
+  if (!hit) return null;
+  lastGameSourceId = hit.id;
+  console.log('Capture target (fullscreen game):', hit.name, hit.id, fg.width, 'x', fg.height);
+  return hit;
+}
 
-  if (fg) {
-    const hit = matchSourceToWindow(gameWindows.length ? gameWindows : usableWindows, fg.hwnd, fg.title);
-    if (hit && gameWindowScore(hit.name, fg) > 0) {
-      lastGameSourceId = hit.id;
-      console.log('Capture target (foreground):', hit.name, hit.id);
-      return hit;
-    }
-  }
-
-  const remembered = currentId || lastGameSourceId;
-  if (remembered && String(remembered).startsWith('window:')) {
-    const cur = gameWindows.find((s) => s.id === remembered);
-    if (cur && gameWindowScore(cur.name) > 1) {
-      console.log('Capture target (remembered):', cur.name, cur.id);
-      return cur;
-    }
-  }
-
-  const scored = gameWindows.map((s) => {
-    const top = tops.find((w) => sourceMatchesHwnd(s, w.hwnd) || String(s.name).toLowerCase() === w.title.toLowerCase());
-    return { s, score: gameWindowScore(s.name, top) };
-  }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score);
-
-  if (scored[0] && scored[0].score >= 8000) {
-    lastGameSourceId = scored[0].s.id;
-    console.log('Capture target (game window):', scored[0].s.name, scored[0].s.id, 'score', scored[0].score);
-    return scored[0].s;
-  }
-
+function pickGameCaptureSource(sources, _currentId) {
+  const game = findExclusiveGameWindow(sources);
+  if (game) return game;
+  const screens = sources.filter((s) => s.id.startsWith('screen:'));
   if (screens[0]) {
-    console.log('Capture target (screen WGC) — exclusive fullscreen / no game HWND');
+    console.log('Capture target (full desktop):', screens[0].name, screens[0].id);
     return screens[0];
   }
-
-  if (scored[0]) {
-    lastGameSourceId = scored[0].s.id;
-    return scored[0].s;
-  }
-
-  return gameWindows[0] || usableWindows[0] || windows[0] || null;
+  const windows = sources.filter((s) => s.id.startsWith('window:'));
+  return windows.find((s) => s.name && !SKIP_CAPTURE_WINDOWS.test(s.name) && !isFolderWindow(s.name)) || windows[0] || null;
 }
 
 function screenFallbackId(sources) {
@@ -2394,6 +4229,109 @@ function startGameWatch() {
   gameWatchTimer = setInterval(() => {
     maybeRetargetCapture().catch((e) => console.warn('game watch failed:', e.message || e));
   }, 3000);
+}
+
+function startDesktopGameWatch() {
+  stopDesktopGameWatch();
+  desktopGameWatchTimer = setInterval(() => {
+    maybeSwitchDesktopToGame().catch((e) => console.warn('desktop game watch failed:', e.message || e));
+  }, 2500);
+}
+
+function stopDesktopGameWatch() {
+  if (!desktopGameWatchTimer) return;
+  clearInterval(desktopGameWatchTimer);
+  desktopGameWatchTimer = null;
+}
+
+async function maybeSwitchDesktopToGame() {
+  if (switchingToGame || usingGameCapture || medal.recording) return;
+  if (!isRecording || isPaused || !session) return;
+  if (settings.exclusiveFullscreen === false) return;
+  let sources;
+  try {
+    sources = await listCaptureSources();
+  } catch (e) {
+    return;
+  }
+  if (!findExclusiveGameWindow(sources)) return;
+  console.log('Fullscreen game opened during desktop recording — switching capture.');
+  await switchDesktopRecordingToGame();
+}
+
+async function switchDesktopRecordingToGame() {
+  if (switchingToGame || usingGameCapture) return { ok: false, error: 'already switching' };
+  if (!isRecording || !session) return { ok: false, error: 'not recording' };
+  switchingToGame = true;
+  stopDesktopGameWatch();
+  const active = session;
+  try {
+    active.intent = 'switching';
+    if (ffmpegProcess) {
+      const proc = ffmpegProcess;
+      sendQuit(proc);
+      await waitForProcessClose(proc);
+    }
+    try {
+      const last = existingSegmentPath(active.folder, active.segmentIndex);
+      if (last && !active.segments.includes(last)) {
+        active.segments.push(last);
+      }
+    } catch (e) { /* ignore */ }
+
+    const audioFile = await stopLoopbackCapture();
+    let prefixSegments = active.segments.slice();
+    if (prefixSegments.length) {
+      try {
+        const prefix = path.join(active.folder, 'desktop-prefix.mp4');
+        concatSegments(prefixSegments, prefix, active.folder);
+        if (audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048) {
+          muxLoopbackAudio(prefix, audioFile, prefix);
+        }
+        prefixSegments = [prefix];
+      } catch (e) {
+        console.warn('Could not mux desktop audio before game switch:', e.message || e);
+      }
+    }
+
+    recordingHandoff = {
+      folder: active.folder,
+      segments: prefixSegments,
+      finalFile: active.finalFile,
+      startedAt: recordingStartedAt,
+      totalPausedMs
+    };
+    session = null;
+    ffmpegProcess = null;
+
+    const result = await startGameCapture({ continueSession: true });
+    if (result && result.ok) return result;
+
+    try {
+      if (recordingHandoff && recordingHandoff.segments.length) {
+        concatSegments(recordingHandoff.segments, recordingHandoff.finalFile, recordingHandoff.folder);
+        currentOutputFile = recordingHandoff.finalFile;
+      }
+      if (recordingHandoff && recordingHandoff.folder) rmSessionFolder(recordingHandoff.folder);
+    } catch (e) { /* ignore */ }
+    recordingHandoff = null;
+    isRecording = false;
+    isPaused = false;
+    stopStatsPolling();
+    restoreMainWindow();
+    broadcastState();
+    updateTrayMenu();
+    dialog.showMessageBox(mainWindow || undefined, {
+      type: 'error',
+      title: 'Could not capture fullscreen',
+      message: 'Stay in the game and press Ctrl+Shift+R again.',
+      detail: (result && result.error) || 'If it still fails, set the game to Windowed Borderless.',
+      buttons: ['OK']
+    });
+    return result || { ok: false, error: 'Game capture failed' };
+  } finally {
+    switchingToGame = false;
+  }
 }
 
 function stopGameWatch() {
@@ -2429,8 +4367,9 @@ async function convertWebmToMp4(webmPath, mp4Path) {
     run(`-hide_banner -y -i "${webmPath}" -c copy -movflags +faststart "${mp4Path}"`);
   } catch (e) {
     try {
-      if (ffmpegCaps.hasH264Amf) {
-        run(`-hide_banner -y -i "${webmPath}" -c:v h264_amf -quality speed -b:v 6M -c:a aac -b:a 160k -movflags +faststart "${mp4Path}"`);
+      const enc = pickActiveEncoder({ hardware: true });
+      if (enc.hardware && enc.ffmpegName !== 'libx264') {
+        run(`-hide_banner -y -i "${webmPath}" -c:v ${enc.ffmpegName} -b:v 6M -c:a aac -b:a 160k -movflags +faststart "${mp4Path}"`);
       } else {
         throw e;
       }
@@ -2443,10 +4382,11 @@ async function convertWebmToMp4(webmPath, mp4Path) {
   }
 }
 
-async function startGameCapture() {
+async function startGameCapture(opts = {}) {
+  const continueSession = Boolean(opts.continueSession);
   // Clicking Start focuses this app — hide first so the game can become foreground
   getOutOfTheWay();
-  await new Promise((r) => setTimeout(r, 700));
+  await new Promise((r) => setTimeout(r, continueSession ? 400 : 700));
 
   const sources = await listCaptureSources();
   console.log(
@@ -2456,24 +4396,30 @@ async function startGameCapture() {
   const source = pickGameCaptureSource(sources, medal.sourceId || lastGameSourceId);
   if (!source) {
     restoreMainWindow();
-    return { ok: false, error: 'No game window found. Open the game, then press Ctrl+Shift+R while it is in front.' };
+    return { ok: false, error: 'No screen to capture. Open the game or app, then press Ctrl+Shift+R.' };
   }
   lastGameSourceId = source.id;
   console.log('Game capture source:', source.name, source.id);
 
   if (!fs.existsSync(settings.outputFolder)) fs.mkdirSync(settings.outputFolder, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // Chromium MediaRecorder/WebCodecs write WebM (EBML / Matroska family). That is the
+  // crash-safe container this engine can actually mux; leftover .webm is remuxed to .mp4 on launch.
   gameCaptureFile = path.join(settings.outputFolder, `recording-${timestamp}.webm`);
   currentOutputFile = path.join(settings.outputFolder, `recording-${timestamp}.mp4`);
   gameCaptureBytes = 0;
   gameCaptureStream = fs.createWriteStream(gameCaptureFile);
   usingGameCapture = true;
 
-  // Fullscreen WGC path — 30fps / up to 1080p (tuned in game-capture.html)
-  const fps = Math.min(30, effectiveFps());
+  // Fullscreen WGC path — fps/resolution follow settings; codec matches the desktop encoder
+  const fps = Math.min(144, Math.max(15, effectiveFps()));
   const audio = settings.recordAudio ? '1' : '0';
   const quality = settings.spaceSaving ? 'light' : 'full';
-  const url = `file://${path.join(__dirname, 'game-capture.html').replace(/\\/g, '/')}?mode=record&sourceId=${encodeURIComponent(source.id)}&screenId=${encodeURIComponent(screenFallbackId(sources))}&fps=${fps}&audio=${audio}&quality=${quality}`;
+  const pixels = capturePixelSize();
+  const codec = webCodecsCodecParam();
+  const hw = pickActiveEncoder({ hardware: true }).hardware ? '1' : '0';
+  const bitrate = captureBitrateBps({ forReplay: false });
+  const url = `file://${path.join(__dirname, 'game-capture.html').replace(/\\/g, '/')}?mode=record&sourceId=${encodeURIComponent(source.id)}&screenId=${encodeURIComponent(screenFallbackId(sources))}&fps=${fps}&audio=${audio}&quality=${quality}&codec=${encodeURIComponent(codec)}&hw=${hw}&bitrate=${bitrate}&maxWidth=${pixels.width}&maxHeight=${pixels.height}`;
 
   gameCaptureWin = new BrowserWindow({
     show: false,
@@ -2533,15 +4479,22 @@ async function startGameCapture() {
 
   isRecording = true;
   isPaused = false; // pause not supported on this path yet
-  recordingStartedAt = Date.now();
-  pauseStartedAt = null;
-  totalPausedMs = 0;
+  if (!continueSession) {
+    recordingStartedAt = Date.now();
+    pauseStartedAt = null;
+    totalPausedMs = 0;
+    playCue('start');
+  } else if (recordingHandoff) {
+    recordingStartedAt = recordingHandoff.startedAt || recordingStartedAt;
+    totalPausedMs = recordingHandoff.totalPausedMs || 0;
+  }
   session = null;
 
   getOutOfTheWay();
   startStatsPolling();
   updateTrayMenu();
   broadcastState();
+  appendDiagnosticsLine(`Audio: Chromium/WGC capture (${describeAudioRoute()})`);
   return { ok: true, file: currentOutputFile, mode: 'game-capture', source: result.source };
 }
 
@@ -2608,6 +4561,40 @@ async function stopGameCapture() {
 
   usingGameCapture = false;
   gameCaptureFile = null;
+
+  const handoff = recordingHandoff;
+  recordingHandoff = null;
+  if (!error && handoff && handoff.segments && handoff.segments.length) {
+    try {
+      const parts = handoff.segments.slice();
+      if (currentOutputFile && fs.existsSync(currentOutputFile) && fs.statSync(currentOutputFile).size >= 8192) {
+        parts.push(currentOutputFile);
+      }
+      concatSegments(parts, handoff.finalFile, handoff.folder);
+      const merged = handoff.finalFile;
+      if (currentOutputFile && currentOutputFile !== merged && fs.existsSync(currentOutputFile)) {
+        try { fs.unlinkSync(currentOutputFile); } catch (e) { /* keep extra file */ }
+      }
+      currentOutputFile = merged;
+      finalSize = fs.existsSync(merged) ? fs.statSync(merged).size : finalSize;
+    } catch (e) {
+      console.warn('Could not join desktop + game into one file:', e.message || e);
+    }
+    try { rmSessionFolder(handoff.folder); } catch (e) { /* ignore */ }
+  } else if (error && handoff && handoff.segments && handoff.segments.length) {
+    try {
+      concatSegments(handoff.segments, handoff.finalFile, handoff.folder);
+      currentOutputFile = handoff.finalFile;
+      finalSize = fs.existsSync(handoff.finalFile) ? fs.statSync(handoff.finalFile).size : 0;
+      error = null;
+    } catch (e) {
+      console.warn('Could not save desktop footage after game switch:', e.message || e);
+    }
+    try { rmSessionFolder(handoff.folder); } catch (e) { /* ignore */ }
+  } else if (handoff && handoff.folder) {
+    try { rmSessionFolder(handoff.folder); } catch (e) { /* ignore */ }
+  }
+
   isRecording = false;
   isPaused = false;
   recordingStartedAt = null;
@@ -2642,8 +4629,10 @@ ipcMain.on('medal-video-chunk', (_e, buf, type, timestamp) => {
     if (medal.recording && !isPaused) {
       medal.sessionVideo.push(item);
       medal.sessionBytes += item.buf.length;
+      appendMedalPartial('video', item.buf);
     }
     pruneMedalRing();
+    maybeSpillMedalSnapshot();
   } catch (e) {
     console.error('medal video chunk failed:', e);
   }
@@ -2654,19 +4643,36 @@ ipcMain.on('medal-audio-chunk', (_e, buf) => {
   try {
     const item = { buf: Buffer.from(buf) };
     medal.audio.push(item);
-    if (medal.recording && !isPaused) medal.sessionAudio.push(item);
+    if (medal.recording && !isPaused) {
+      medal.sessionAudio.push(item);
+      appendMedalPartial('audio', item.buf);
+    }
   } catch (e) {
     console.error('medal audio chunk failed:', e);
   }
 });
 
 ipcMain.on('medal-capture-stats', (_e, info) => {
-  if (!info || info.captureFps == null) return;
-  liveCaptureFps = Number(info.captureFps);
+  if (!info) return;
+  if (typeof info.captureFps === 'number' && info.captureFps > 0) liveCaptureFps = Number(info.captureFps);
   if (typeof info.audioPeak === 'number') lastAudioPeak = info.audioPeak;
+  if (typeof info.loopbackPeak === 'number') lastLoopbackPeak = info.loopbackPeak;
+  if (typeof info.micPeak === 'number') lastMicPeak = info.micPeak;
   if (typeof info.hasLoopback === 'boolean') medal.hasLoopback = info.hasLoopback;
   if (typeof info.hasMic === 'boolean') medal.hasMic = info.hasMic;
   if (info.audioLive != null) medal.hasAudio = Boolean(info.audioLive);
+  if (info.audioDropped) {
+    appendDiagnosticsLine(`Audio: Chromium track ended (${info.audioDropped})`);
+    if (info.audioDropped === 'loopback') {
+      lastLoopbackPeak = 0;
+      medal.hasLoopback = false;
+      notifyUser('Game audio source dropped');
+    } else if (info.audioDropped === 'mic') {
+      lastMicPeak = 0;
+      medal.hasMic = false;
+      notifyUser('Microphone unplugged');
+    }
+  }
   if (isRecording) pushCaptureStatsToUi();
 });
 
@@ -2699,38 +4705,30 @@ async function startRecording() {
     };
   }
 
-  // Instant Replay holds DXGI — release it, then capture with a fresh DDA session
+  // Instant Replay holds DXGI — release it before a live recording
   if (instantReplayActive || replayProcess) {
     await pauseReplayForRecording();
-  } else if (settings.instantReplayEnabled) {
-    replayPausedForRecording = false;
+  }
+  replayPausedForRecording = true;
+
+  const flagged = settings.exclusiveFullscreen !== false ? foregroundGameIdentity() : null;
+  if (flagged && isKnownUnstableGame(flagged)) {
+    appendDiagnosticsLine(`Capture: skipping ddagrab for known-unstable ${flagged.exe || flagged.title}`);
+    const gameCap = await startGameCapture();
+    if (gameCap.ok) return gameCap;
+    console.warn('Known-unstable game capture failed, trying desktop:', gameCap.error);
   }
 
-  const audioDevice = getSelectedAudioDevice();
-  if (settings.recordAudio && !audioDevice) {
-    console.warn('No audio device selected. Recording video only.');
-    if (settings.audioSource !== 'mic') {
-      dialog.showMessageBox(mainWindow || undefined, {
-        type: 'warning',
-        title: 'Game audio not available',
-        message: 'No system/game audio device found.',
-        detail: 'You have VB-Cable or need Stereo Mix.\n\n1) Open Sound settings → Playback → set default to “CABLE Input” (hear via Cable app or set Listening).\n2) In Ordinary Recorder pick “CABLE Output (VB-Audio Virtual Cable)”.\n\nOr switch Audio source to Microphone for voice only.',
-        buttons: ['OK']
-      });
-    }
-  } else if (
-    settings.recordAudio &&
-    settings.audioSource !== 'mic' &&
-    audioDevice &&
-    isMicrophoneDevice(audioDevice)
-  ) {
-    dialog.showMessageBox(mainWindow || undefined, {
-      type: 'info',
-      title: 'Recording microphone only',
-      message: 'Audio device is a microphone — game sounds will not be recorded.',
-      detail: 'Select “CABLE Output (VB-Audio Virtual Cable)” under Audio device, and set Windows/game output to “CABLE Input”.',
-      buttons: ['OK']
-    });
+  // Fullscreen games need WGC window capture. Everything else (desktop, browsers,
+  // other software, windowed/borderless games) is recorded as the whole screen.
+  let exclusiveGame = false;
+  try {
+    exclusiveGame = Boolean(findExclusiveGameWindow(await listCaptureSources()));
+  } catch (e) { /* ignore */ }
+  if (exclusiveGame) {
+    const gameCap = await startGameCapture();
+    if (gameCap.ok) return gameCap;
+    console.warn('Fullscreen game capture failed, trying full desktop:', gameCap.error);
   }
 
   if (!fs.existsSync(settings.outputFolder)) fs.mkdirSync(settings.outputFolder, { recursive: true });
@@ -2742,8 +4740,7 @@ async function startRecording() {
   currentOutputFile = path.join(settings.outputFolder, `recording-${timestamp}.mp4`);
 
   let useDdagrab = ffmpegCaps.hasDdagrab;
-  // Game mode: always use working h264_amf when available (skip flaky hevc)
-  let useAmf = Boolean(ffmpegCaps.hasH264Amf || (!settings.gameMode && ffmpegCaps.hasHevcAmf));
+  let useAmf = pickActiveEncoder({ hardware: true }).hardware;
   if (settings.gameMode) useDdagrab = ffmpegCaps.hasDdagrab; // never prefer GDI for games
 
   session = {
@@ -2754,8 +4751,12 @@ async function startRecording() {
     useDdagrab,
     useAmf,
     forceAmfDownload: false,
-    audioDevice,
-    useWasapi: Boolean(settings.recordAudio && settings.audioSource !== 'mic'),
+    audioDevice: null,
+    micDevice: null,
+    useWasapi: false,
+    useLoopback: Boolean(settings.recordAudio),
+    audioOpened: false,
+    audioDropped: false,
     intent: 'running'
   };
 
@@ -2769,15 +4770,82 @@ async function startRecording() {
   getOutOfTheWay();
   await new Promise((r) => setTimeout(r, 400));
 
+  let loopback = { ok: false };
+  if (settings.recordAudio) {
+    refreshAudioProbe({ testWasapi: audioProbe.wasapiWorks == null });
+    const devices = ffmpegCaps.available ? listDshowAudioDevices() : [];
+    const micDevice = (
+      settings.audioSource !== 'mic' &&
+      settings.pttEnabled !== true
+    ) ? pickMicrophoneDevice(devices) : (
+      settings.audioSource === 'mic' ? pickMicrophoneDevice(devices) : null
+    );
+
+    if (settings.audioSource === 'mic') {
+      const micOnly = micDevice || pickMicrophoneDevice(devices);
+      session.useWasapi = false;
+      session.useLoopback = false;
+      session.audioDevice = micOnly;
+      session.micDevice = null;
+      appendDiagnosticsLine(`Audio: microphone only (${micOnly || 'none'})`);
+      if (!micOnly) notifyUser('No microphone found — recording will be silent');
+    } else if (audioProbe.wasapiWorks) {
+      session.useWasapi = true;
+      session.useLoopback = false;
+      session.audioDevice = null;
+      session.micDevice = micDevice;
+      appendDiagnosticsLine(`Audio: using WASAPI loopback (${describeAudioRoute()})`);
+    } else {
+      try {
+        loopback = await startLoopbackCapture(sessionFolder);
+      } catch (e) {
+        loopback = { ok: false, error: e.message || String(e) };
+      }
+      if (loopback.ok) {
+        console.log('Recording desktop audio from speakers/headphones (loopback).');
+        appendDiagnosticsLine(`Audio: Chromium loopback (${describeAudioRoute()})`);
+      } else {
+        console.warn('Loopback audio failed, trying DirectShow:', loopback.error);
+        let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
+        if (audioDevice && audioDevice !== settings.audioDevice) {
+          settings.audioDevice = audioDevice;
+          saveSettings(settings);
+        }
+        session.audioDevice = audioDevice;
+        session.micDevice = (
+          settings.audioSource !== 'mic' &&
+          settings.pttEnabled !== true &&
+          audioDevice &&
+          !isMicrophoneDevice(audioDevice)
+        ) ? pickMicrophoneDevice(devices) : micDevice;
+        session.useLoopback = false;
+        session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
+        appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
+        if (!audioDevice && !session.useWasapi) {
+          notifyUser('No game audio source — recording will be silent');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('recording-state', {
+              ...getStatePayload(),
+              warning: audioProbe.hint
+            });
+          }
+        }
+      }
+    }
+  }
+
   launchSegment();
+  startDesktopGameWatch();
   startStatsPolling();
   updateTrayMenu();
   broadcastState();
+  playCue('start');
   return { ok: true, file: currentOutputFile, replayPaused: replayPausedForRecording };
 }
 
 async function pauseRecording() {
   if (!isRecording) return { ok: false, error: 'Not recording' };
+  stopDesktopGameWatch();
   if (medal.recording) {
     isPaused = true;
     pauseStartedAt = Date.now();
@@ -2793,6 +4861,7 @@ async function pauseRecording() {
   if (!ffmpegProcess || !session) return { ok: false, error: 'No active segment' };
 
   session.intent = 'pausing';
+  try { if (loopbackWin && !loopbackWin.isDestroyed()) loopbackWin.webContents.send('loopback-control', 'pause'); } catch (e) { /* ignore */ }
   const proc = ffmpegProcess;
   sendQuit(proc);
   await waitForProcessClose(proc);
@@ -2827,7 +4896,9 @@ async function resumeRecording() {
 
   nextSegmentPath(); // advances segmentIndex for segment-2, segment-3, ...
   isPaused = false;
+  try { if (loopbackWin && !loopbackWin.isDestroyed()) loopbackWin.webContents.send('loopback-control', 'resume'); } catch (e) { /* ignore */ }
   launchSegment();
+  startDesktopGameWatch();
   updateTrayMenu();
   broadcastState();
   return { ok: true, isPaused: false };
@@ -2835,6 +4906,8 @@ async function resumeRecording() {
 
 async function stopRecording() {
   if (!isRecording) return { ok: false, error: 'Not recording' };
+  stopDesktopGameWatch();
+  playCue('stop');
   if (medal.recording) return stopMedalRecording();
   if (usingGameCapture) return stopGameCapture();
   if (!session) return { ok: false, error: 'Not recording' };
@@ -2850,10 +4923,12 @@ async function stopRecording() {
     // Segment already finalized on pause; nothing to quit
   }
 
+  const audioFile = await stopLoopbackCapture();
+
   // Ensure current segment is tracked if it finished with content
   try {
-    const last = path.join(activeSession.folder, `segment-${activeSession.segmentIndex}.mp4`);
-    if (fs.existsSync(last) && fs.statSync(last).size > 0 && !activeSession.segments.includes(last)) {
+    const last = session && existingSegmentPath(activeSession.folder, activeSession.segmentIndex);
+    if (last && !activeSession.segments.includes(last)) {
       activeSession.segments.push(last);
     }
   } catch (e) { /* ignore */ }
@@ -2866,6 +4941,13 @@ async function stopRecording() {
     } else {
       concatSegments(activeSession.segments, activeSession.finalFile);
       currentOutputFile = activeSession.finalFile;
+      if (audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048) {
+        try {
+          muxLoopbackAudio(currentOutputFile, audioFile, currentOutputFile);
+        } catch (e) {
+          console.warn('Could not mux desktop audio:', e.message || e);
+        }
+      }
       try {
         finalSize = fs.existsSync(currentOutputFile) ? fs.statSync(currentOutputFile).size : 0;
       } catch (e) { finalSize = 0; }
@@ -2998,11 +5080,15 @@ function registerGlobalHotkeys() {
     if (!settings.instantReplayEnabled && !medal.active) return;
     saveInstantReplay();
   });
+  const markOk = bind(settings.bookmarkHotkey, () => {
+    markReplayBookmark();
+  });
 
   return {
     hotkey: recOk,
     pauseHotkey: pauseOk,
-    replayHotkey: clipOk
+    replayHotkey: clipOk,
+    bookmarkHotkey: markOk
   };
 }
 
@@ -3041,18 +5127,192 @@ function createTray() {
   tray.on('double-click', () => mainWindow.show());
 }
 
+function resolveLibraryFile(filePath) {
+  const resolved = path.resolve(String(filePath || ''));
+  const root = path.resolve(settings.outputFolder);
+  const rel = path.relative(root, resolved);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  try {
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return null;
+  } catch (e) {
+    return null;
+  }
+  return resolved;
+}
+
+function parseDurationSeconds(text) {
+  const m = String(text || '').match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!m) return 0;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+function probeRecordingFile(filePath) {
+  const resolved = resolveLibraryFile(filePath);
+  if (!resolved) return { ok: false, error: 'That file is not in your recordings folder' };
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  let duration = 0;
+  try {
+    runFfmpegArgv(ffmpegPath, ['-hide_banner', '-i', resolved], 25000);
+  } catch (e) {
+    duration = parseDurationSeconds(`${e.stderr || ''}${e.stdout || ''}${e.message || ''}`);
+  }
+  if (!duration) {
+    try { duration = 0; } catch (e) { /* ignore */ }
+  }
+  return {
+    ok: true,
+    path: resolved,
+    url: pathToFileURL(resolved).href,
+    duration,
+    name: path.basename(resolved)
+  };
+}
+
+function formatTrimStamp(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const mm = String(Math.floor(s / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${mm}m${ss}s`;
+}
+
+function trimRecordingFile({ filePath, startSec, endSec, precise }) {
+  const resolved = resolveLibraryFile(filePath);
+  if (!resolved) return { ok: false, error: 'That file is not in your recordings folder' };
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) return { ok: false, error: 'FFmpeg not found' };
+
+  const start = Math.max(0, Number(startSec) || 0);
+  let end = Math.max(start + 0.2, Number(endSec) || 0);
+  const probed = probeRecordingFile(resolved);
+  if (probed.ok && probed.duration && end > probed.duration) end = probed.duration;
+  if (end - start < 0.2) return { ok: false, error: 'Trim range is too short' };
+
+  const ext = path.extname(resolved) || '.mp4';
+  const base = path.basename(resolved, ext);
+  const outName = `${base}-trim-${formatTrimStamp(start)}-${formatTrimStamp(end)}${ext === '.webm' ? '.mp4' : ext}`;
+  const outputFile = path.join(settings.outputFolder, outName);
+  if (fs.existsSync(outputFile)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const alt = path.join(settings.outputFolder, `${base}-trim-${stamp}.mp4`);
+    return trimToPath(ffmpegPath, resolved, alt, start, end, Boolean(precise));
+  }
+  return trimToPath(ffmpegPath, resolved, outputFile, start, end, Boolean(precise));
+}
+
+function trimToPath(ffmpegPath, inputFile, outputFile, start, end, precise) {
+  const duration = Math.max(0.2, end - start);
+  try {
+    if (!precise) {
+      runFfmpegArgv(ffmpegPath, [
+        '-hide_banner', '-y',
+        '-ss', start.toFixed(3),
+        '-to', end.toFixed(3),
+        '-i', inputFile,
+        '-c', 'copy',
+        '-avoid_negative_ts', 'make_zero',
+        '-movflags', '+faststart',
+        outputFile
+      ], 180000);
+    } else {
+      const args = ['-hide_banner', '-y', '-i', inputFile, '-ss', start.toFixed(3), '-t', duration.toFixed(3)];
+      pushStableVideoEncoderArgs(args, { fps: effectiveFps(), useAmf: pickActiveEncoder({ hardware: true }).hardware, forReplay: false });
+      args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-ar', '48000', '-movflags', '+faststart', outputFile);
+      runFfmpegArgv(ffmpegPath, args, 300000);
+    }
+  } catch (e) {
+    if (!precise) {
+      try {
+        return trimToPath(ffmpegPath, inputFile, outputFile, start, end, true);
+      } catch (e2) {
+        return { ok: false, error: e2.message || String(e2) };
+      }
+    }
+    return { ok: false, error: e.message || String(e) };
+  }
+  try {
+    if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size < 8192) {
+      return { ok: false, error: 'Trim produced an empty file' };
+    }
+  } catch (e) {
+    return { ok: false, error: 'Trim did not write a file' };
+  }
+  return { ok: true, file: outputFile, name: path.basename(outputFile) };
+}
+
+function applyWizardChoices(overrides) {
+  const defaults = wizardDefaultsForTier(hardwareInfo.tier);
+  const next = { ...defaults, ...(overrides || {}) };
+  settings.fps = Number(next.fps) === 144 || Number(next.fps) === 60 ? Number(next.fps) : 30;
+  settings.outputResolution = ['native', '1440', '1080', '720'].includes(next.outputResolution)
+    ? next.outputResolution
+    : defaults.outputResolution;
+  settings.videoCodec = ['h264', 'hevc', 'av1'].includes(next.videoCodec) ? next.videoCodec : 'h264';
+  settings.encoder = ['auto', 'nvenc', 'amf', 'qsv', 'x264'].includes(next.encoder) ? next.encoder : 'auto';
+  settings.spaceSaving = next.spaceSaving !== false;
+  settings.instantReplayMinutes = Math.min(
+    maxReplayMinutesForRam(),
+    Math.min(5, Math.max(1, Number(next.instantReplayMinutes) || defaults.instantReplayMinutes))
+  );
+  settings.instantReplaySaveMinutes = [0.5, 1, 2, 3, 4, 5].includes(Number(next.instantReplaySaveMinutes))
+    ? Number(next.instantReplaySaveMinutes)
+    : defaults.instantReplaySaveMinutes;
+  settings.wizardCompleted = true;
+  settings.hardwareProfile = {
+    tier: hardwareInfo.tier,
+    gpuName: hardwareInfo.gpuName,
+    vendor: hardwareInfo.vendor,
+    vramBytes: hardwareInfo.vramBytes,
+    ramBytes: hardwareInfo.ramBytes,
+    cpuCores: hardwareInfo.cpuCores,
+    cpuModel: hardwareInfo.cpuModel,
+    discrete: hardwareInfo.discrete,
+    defaults: {
+      fps: settings.fps,
+      outputResolution: settings.outputResolution,
+      instantReplayMinutes: settings.instantReplayMinutes,
+      videoCodec: settings.videoCodec
+    },
+    detectedAt: Date.now()
+  };
+  saveSettings(settings);
+  refreshSelectedEncoder();
+  writeDiagnosticsLog();
+  if (settings.instantReplayEnabled && !isRecording && !replayProcess) {
+    startReplayProcess({ clearBuffer: true });
+  }
+  return { ok: true, settings, hardware: getHardwareUiPayload() };
+}
+
 // ---------- IPC ----------
 ipcMain.handle('get-settings', () => settings);
+ipcMain.handle('get-hardware', () => getHardwareUiPayload());
+ipcMain.handle('complete-wizard', (_e, payload) => {
+  const customize = Boolean(payload && payload.customize);
+  return applyWizardChoices(customize ? (payload.settings || {}) : null);
+});
+ipcMain.handle('probe-recording', (_e, filePath) => probeRecordingFile(filePath));
+ipcMain.handle('trim-recording', (_e, opts) => {
+  try {
+    return trimRecordingFile(opts || {});
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+});
 ipcMain.handle('save-settings', (e, newSettings) => {
   const prevFps = settings.instantReplayFps;
   const prevGame = settings.gameMode;
   const prevAudio = settings.recordAudio;
   const prevBufferMinutes = settings.instantReplayMinutes;
   const prevPtt = settings.pttEnabled;
+  const prevEncoder = settings.encoder;
+  const prevCodec = settings.videoCodec;
+  const prevRes = settings.outputResolution;
+  const prevRecordFps = settings.fps;
   const prevHotkeys = {
     hotkey: settings.hotkey,
     pauseHotkey: settings.pauseHotkey,
-    replayHotkey: settings.replayHotkey
+    replayHotkey: settings.replayHotkey,
+    bookmarkHotkey: settings.bookmarkHotkey
   };
   settings = { ...settings, ...newSettings };
 
@@ -3063,7 +5323,16 @@ ipcMain.handle('save-settings', (e, newSettings) => {
     }
   }
 
-  settings.instantReplayMinutes = Math.min(5, Math.max(1, Number(settings.instantReplayMinutes) || 5));
+  settings.encoder = ['auto', 'nvenc', 'amf', 'qsv', 'x264'].includes(settings.encoder) ? settings.encoder : 'auto';
+  settings.videoCodec = ['h264', 'hevc', 'av1'].includes(settings.videoCodec) ? settings.videoCodec : 'h264';
+  settings.outputResolution = ['native', '1440', '1080', '720'].includes(settings.outputResolution)
+    ? settings.outputResolution
+    : 'native';
+  const recFps = Number(settings.fps);
+  settings.fps = recFps === 144 || recFps === 60 ? recFps : 30;
+  settings.diskSpaceLimitMb = Math.min(4096, Math.max(200, Number(settings.diskSpaceLimitMb) || 500));
+  settings.knownUnstableGames = sanitizeKnownGames(settings.knownUnstableGames);
+  settings.instantReplayMinutes = Math.min(maxReplayMinutesForRam(), Math.min(5, Math.max(1, Number(settings.instantReplayMinutes) || 5)));
   const saveOpts = [0.5, 1, 2, 3, 4, 5];
   const saveMin = Number(settings.instantReplaySaveMinutes);
   settings.instantReplaySaveMinutes = saveOpts.includes(saveMin) ? saveMin : 2;
@@ -3073,7 +5342,6 @@ ipcMain.handle('save-settings', (e, newSettings) => {
   } else {
     settings.instantReplayFps = Number(settings.instantReplayFps);
   }
-  settings.fps = Number(settings.fps) === 60 ? 60 : 30;
   settings.exclusiveFullscreen = Boolean(settings.exclusiveFullscreen);
   settings.gameMode = Boolean(settings.gameMode);
   settings.amfRateControl = settings.amfRateControl === 'cqp' ? 'cqp' : 'vbr_peak';
@@ -3083,14 +5351,16 @@ ipcMain.handle('save-settings', (e, newSettings) => {
   settings.hotkey = sanitizeAccelerator(settings.hotkey, defaultSettings.hotkey);
   settings.pauseHotkey = sanitizeAccelerator(settings.pauseHotkey, defaultSettings.pauseHotkey);
   settings.replayHotkey = sanitizeAccelerator(settings.replayHotkey, defaultSettings.replayHotkey);
+  settings.bookmarkHotkey = sanitizeAccelerator(settings.bookmarkHotkey, defaultSettings.bookmarkHotkey);
   settings.settingsVersion = SETTINGS_VERSION;
 
-  const hotkeyList = [settings.hotkey, settings.pauseHotkey, settings.replayHotkey];
+  const hotkeyList = [settings.hotkey, settings.pauseHotkey, settings.replayHotkey, settings.bookmarkHotkey];
   let hotkeyError = null;
   if (new Set(hotkeyList).size !== hotkeyList.length) {
     settings.hotkey = prevHotkeys.hotkey;
     settings.pauseHotkey = prevHotkeys.pauseHotkey;
     settings.replayHotkey = prevHotkeys.replayHotkey;
+    settings.bookmarkHotkey = prevHotkeys.bookmarkHotkey;
     hotkeyError = 'Each action needs a different shortcut';
   }
 
@@ -3104,6 +5374,7 @@ ipcMain.handle('save-settings', (e, newSettings) => {
   } catch (e) { /* ignore */ }
 
   saveSettings(settings);
+  refreshSelectedEncoder();
   startPttWatcher();
   sendCaptureAudioMode();
   const registered = registerGlobalHotkeys();
@@ -3113,6 +5384,7 @@ ipcMain.handle('save-settings', (e, newSettings) => {
       settings.hotkey = prevHotkeys.hotkey;
       settings.pauseHotkey = prevHotkeys.pauseHotkey;
       settings.replayHotkey = prevHotkeys.replayHotkey;
+      settings.bookmarkHotkey = prevHotkeys.bookmarkHotkey;
       saveSettings(settings);
       registerGlobalHotkeys();
       hotkeyError = 'That shortcut is already used by Windows or another app';
@@ -3138,23 +5410,41 @@ ipcMain.handle('save-settings', (e, newSettings) => {
     instantReplayActive &&
     !isRecording &&
     !medal.active &&
-    (prevFps !== settings.instantReplayFps || prevGame !== settings.gameMode || prevBufferMinutes !== settings.instantReplayMinutes)
+    (
+      prevFps !== settings.instantReplayFps ||
+      prevGame !== settings.gameMode ||
+      prevBufferMinutes !== settings.instantReplayMinutes ||
+      prevEncoder !== settings.encoder ||
+      prevCodec !== settings.videoCodec ||
+      prevRes !== settings.outputResolution ||
+      prevRecordFps !== settings.fps
+    )
   ) {
     restartReplayProcess();
   }
 
-  return { ...settings, hotkeyError };
+  return { ...settings, hotkeyError, hardware: getHardwareUiPayload() };
 });
 ipcMain.handle('list-audio-devices', () => {
-  if (!ffmpegCaps.available) return { devices: [], hint: 'FFmpeg not ready', audioSource: settings.audioSource };
-  const devices = listDshowAudioDevices();
+  const probe = refreshAudioProbe({ testWasapi: audioProbe.wasapiWorks == null });
+  if (!ffmpegCaps.available) {
+    return { devices: [], hint: 'FFmpeg not ready', audioSource: settings.audioSource, probe };
+  }
   return {
-    devices,
-    hint: getAudioSetupHint(devices),
+    devices: probe.devices,
+    hint: probe.hint,
+    warning: probe.warning,
     audioSource: settings.audioSource === 'mic' ? 'mic' : 'system',
-    preferred: resolveAudioDevice(devices)
+    preferred: probe.preferred,
+    loopbackKind: probe.loopbackKind,
+    wasapiWorks: probe.wasapiWorks,
+    stereoMix: probe.stereoMix,
+    virtualCable: probe.virtualCable,
+    probe
   };
 });
+ipcMain.handle('test-audio', () => testAudioCapture());
+ipcMain.handle('mark-replay-bookmark', () => markReplayBookmark());
 ipcMain.handle('start-recording', async () => {
   try {
     const result = await startRecording();
@@ -3171,6 +5461,7 @@ ipcMain.handle('toggle-instant-replay', (e, enable) => toggleInstantReplay(enabl
 ipcMain.handle('save-instant-replay', (e, saveMinutes) => saveInstantReplay(saveMinutes));
 ipcMain.handle('get-instant-replay-state', () => getInstantReplayState());
 ipcMain.handle('get-state', () => getStatePayload());
+ipcMain.handle('forget-unstable-game', (_e, id) => forgetUnstableGame(id));
 ipcMain.handle('choose-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory'] });
   if (result.canceled) return settings.outputFolder;
@@ -3186,7 +5477,8 @@ ipcMain.handle('list-recordings', () => {
     if (!fs.existsSync(folder)) return { folder, files };
     for (const name of fs.readdirSync(folder)) {
       if (!name || name.startsWith('.')) continue;
-      if (!/\.(mp4|webm|mkv|mov)$/i.test(name)) continue;
+      if (/\.partial\./i.test(name) || /\.mkv$/i.test(name)) continue;
+      if (!/\.(mp4|webm|mov)$/i.test(name)) continue;
       const full = path.join(folder, name);
       let st;
       try { st = fs.statSync(full); } catch (e) { continue; }
@@ -3227,6 +5519,8 @@ ipcMain.handle('set-hotkey-capture', (_e, enable) => {
 app.whenReady().then(() => {
   if (!gotSingleInstanceLock) return;
 
+  try { probeHardware(); } catch (e) { console.warn('Hardware probe failed:', e.message || e); }
+
   createWindow();
   createTray();
   startPttWatcher();
@@ -3236,14 +5530,46 @@ app.whenReady().then(() => {
   setTimeout(async () => {
     try {
       const caps = await probeFfmpegAsync();
+      refreshSelectedEncoder();
+      writeDiagnosticsLog();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('hardware-ready', getHardwareUiPayload());
+      }
       console.log('FFmpeg path:', caps.path, caps);
       showFfmpegWarning(caps);
 
-      if (settings.instantReplayEnabled && !isRecording) {
+      try {
+        refreshAudioProbe({ testWasapi: true });
+        appendDiagnosticsLine(`Audio probe: ${describeAudioRoute()}`);
+        writeDiagnosticsLog();
+      } catch (audioErr) {
+        console.warn('Audio probe failed:', audioErr.message || audioErr);
+      }
+
+      try {
+        const recovered = recoverCrashedRecordings();
+        if (recovered.length) {
+          const msg = recovered.length === 1
+            ? 'Recovered 1 recording from last session'
+            : `Recovered ${recovered.length} recordings from last session`;
+          notifyUser(msg);
+          appendDiagnosticsLine(`Recovery: ${msg} (${recovered.map((p) => path.basename(p)).join(', ')})`);
+        }
+      } catch (recErr) {
+        console.warn('Crash recovery failed:', recErr.message || recErr);
+      }
+
+      startDiskSpacePolling();
+
+      if (settings.instantReplayEnabled && !isRecording && settings.wizardCompleted) {
         startReplayProcess({ clearBuffer: true });
       }
     } catch (e) {
       console.error('FFmpeg probe failed:', e);
+      startDiskSpacePolling();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('hardware-ready', getHardwareUiPayload());
+      }
     }
   }, app.isPackaged ? 1200 : 600);
 
@@ -3256,6 +5582,16 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     // keep running in tray instead of fully quitting
   }
+});
+
+app.on('before-quit', (e) => {
+  if (quittingClean || !isRecording) return;
+  e.preventDefault();
+  quittingClean = true;
+  Promise.resolve()
+    .then(() => stopRecording())
+    .catch((err) => console.warn('Clean stop on quit failed:', err && err.message))
+    .finally(() => app.quit());
 });
 
 app.on('will-quit', () => {

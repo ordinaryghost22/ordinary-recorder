@@ -27,6 +27,20 @@ const replayBufferSelect = document.getElementById('replayBufferSelect');
 const fpsSelect = document.getElementById('fpsSelect');
 const gameModeToggle = document.getElementById('gameModeToggle');
 const exclusiveFullscreenToggle = document.getElementById('exclusiveFullscreenToggle');
+const diskSpaceSelect = document.getElementById('diskSpaceSelect');
+const unstableGamesList = document.getElementById('unstableGamesList');
+const unstableGamesEmpty = document.getElementById('unstableGamesEmpty');
+const diskBanner = document.getElementById('diskBanner');
+const diskBannerText = document.getElementById('diskBannerText');
+const appNotice = document.getElementById('appNotice');
+const resolutionSelect = document.getElementById('resolutionSelect');
+const encoderSelect = document.getElementById('encoderSelect');
+const codecSelect = document.getElementById('codecSelect');
+const encoderHint = document.getElementById('encoderHint');
+const codecHint = document.getElementById('codecHint');
+const codecSizeHint = document.getElementById('codecSizeHint');
+const spaceSavingDesc = document.getElementById('spaceSavingDesc');
+const replayRamHint = document.getElementById('replayRamHint');
 const audioSourceSelect = document.getElementById('audioSourceSelect');
 const audioDeviceSelect = document.getElementById('audioDeviceSelect');
 const audioHint = document.getElementById('audioHint');
@@ -38,6 +52,14 @@ const replayNote = document.getElementById('replayNote');
 const hotkeyRecord = document.getElementById('hotkeyRecord');
 const hotkeyPause = document.getElementById('hotkeyPause');
 const hotkeyClip = document.getElementById('hotkeyClip');
+const hotkeyBookmark = document.getElementById('hotkeyBookmark');
+const audioMeters = document.getElementById('audioMeters');
+const gameLevelFill = document.getElementById('gameLevelFill');
+const micLevelFill = document.getElementById('micLevelFill');
+const audioDiag = document.getElementById('audioDiag');
+const testAudioBtn = document.getElementById('testAudioBtn');
+const testAudioStatus = document.getElementById('testAudioStatus');
+const testAudioPlayer = document.getElementById('testAudioPlayer');
 const hotkeyReset = document.getElementById('hotkeyReset');
 const hotkeyNote = document.getElementById('hotkeyNote');
 const recKeyHint = document.getElementById('recKeyHint');
@@ -55,10 +77,13 @@ let listeningBind = null;
 let activeView = 'recorder';
 let wasRecording = false;
 let clipFiles = [];
+let trimTarget = null;
+let hardwareInfo = null;
 let currentHotkeys = {
   hotkey: 'CommandOrControl+Shift+R',
   pauseHotkey: 'CommandOrControl+Shift+P',
-  replayHotkey: 'CommandOrControl+Shift+I'
+  replayHotkey: 'CommandOrControl+Shift+I',
+  bookmarkHotkey: 'CommandOrControl+Shift+B'
 };
 
 function formatElapsed(ms) {
@@ -79,6 +104,208 @@ function formatBytes(bytes) {
   }
   const digits = unit === 0 ? 0 : value < 100 ? 1 : 0;
   return `${value.toFixed(digits)} ${units[unit]}`;
+}
+
+function showAppNotice(message) {
+  if (!appNotice) return;
+  const text = String(message || '').trim();
+  if (!text) {
+    appNotice.hidden = true;
+    appNotice.textContent = '';
+    return;
+  }
+  appNotice.hidden = false;
+  appNotice.textContent = text;
+  if (showAppNotice._t) clearTimeout(showAppNotice._t);
+  showAppNotice._t = setTimeout(() => {
+    if (appNotice) {
+      appNotice.hidden = true;
+      appNotice.textContent = '';
+    }
+  }, 8000);
+}
+
+function renderDiskBanner(state) {
+  if (!diskBanner) return;
+  const active = Boolean(state && (state.isRecording || (state.instantReplay && state.instantReplay.active)));
+  const warn = state && state.diskWarning;
+  if (!active || !warn) {
+    diskBanner.hidden = true;
+    return;
+  }
+  const free = formatBytes(state.diskFreeBytes || 0);
+  const limit = formatBytes(state.diskLimitBytes || 0);
+  diskBanner.hidden = false;
+  if (diskBannerText) {
+    diskBannerText.textContent = warn === 'critical'
+      ? `Only ${free} left on the output drive. Recording will stop at ${limit} free.`
+      : `${free} free on the output drive. Recording will stop automatically below ${limit}.`;
+  }
+}
+
+function renderUnstableGames(list) {
+  if (!unstableGamesList) return;
+  const games = Array.isArray(list) ? list : [];
+  unstableGamesList.querySelectorAll('.fallback-item').forEach((el) => el.remove());
+  if (unstableGamesEmpty) unstableGamesEmpty.hidden = games.length > 0;
+  for (const game of games) {
+    const row = document.createElement('div');
+    row.className = 'fallback-item';
+    const copy = document.createElement('div');
+    copy.className = 'fallback-name';
+    copy.textContent = game.title || game.exe || game.id;
+    if (game.exe && game.exe !== game.title) {
+      const sub = document.createElement('span');
+      sub.textContent = game.exe;
+      copy.appendChild(sub);
+    }
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-quiet';
+    btn.textContent = 'Remove';
+    btn.addEventListener('click', async () => {
+      if (!window.recorder.forgetUnstableGame) return;
+      const result = await window.recorder.forgetUnstableGame(game.id || game.exe);
+      renderUnstableGames(result && result.knownUnstableGames);
+    });
+    row.appendChild(copy);
+    row.appendChild(btn);
+    unstableGamesList.appendChild(row);
+  }
+}
+
+function formatClock(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const mm = String(Math.floor(s / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+function gbLabel(bytes) {
+  if (!bytes) return '—';
+  return `${(Number(bytes) / (1024 ** 3)).toFixed(1)} GB`;
+}
+
+function applyReplayRamCap(maxMinutes, estimatedRamBytes) {
+  const cap = Math.min(5, Math.max(1, Number(maxMinutes) || 5));
+  if (replayBufferSelect) {
+    Array.from(replayBufferSelect.options).forEach((opt) => {
+      const m = Number(opt.value);
+      opt.disabled = m > cap;
+    });
+    if (Number(replayBufferSelect.value) > cap) {
+      replayBufferSelect.value = String(cap);
+      syncSelectUI(replayBufferSelect);
+    }
+    const wrap = replayBufferSelect.closest('.select-wrap');
+    if (wrap) {
+      wrap.querySelectorAll('.select-option').forEach((el) => {
+        const m = Number(el.dataset.value);
+        el.hidden = m > cap;
+        el.classList.toggle('is-disabled', m > cap);
+      });
+    }
+  }
+  if (replayRamHint) {
+    const ram = estimatedRamBytes != null ? ` · ~${formatBytes(estimatedRamBytes)} RAM` : '';
+    replayRamHint.textContent = `How much gameplay to keep rolling${ram}. Max ${cap} min on this PC.`;
+  }
+}
+
+function applyHardware(hw) {
+  if (!hw) return;
+  hardwareInfo = hw;
+  const enc = hw.encoder || {};
+  if (encoderSelect && enc.families) {
+    const items = enc.families.map((f) => ({
+      value: f.value,
+      label: f.available === false ? `${f.label} (unavailable)` : f.label
+    }));
+    setSelectOptions(encoderSelect, items, enc.encoder || 'auto');
+  }
+  if (codecSelect && enc.codecs) {
+    const items = enc.codecs.filter((c) => c.available !== false).map((c) => ({
+      value: c.value,
+      label: c.label
+    }));
+    if (!items.length) items.push({ value: 'h264', label: 'H.264' });
+    const selected = items.some((i) => i.value === enc.videoCodec) ? enc.videoCodec : items[0].value;
+    setSelectOptions(codecSelect, items, selected);
+  }
+  if (encoderHint && enc.selected) {
+    encoderHint.textContent = enc.selected.reason || enc.selected.label;
+  }
+  if (codecSizeHint && enc.sizeEstimate) {
+    const s = enc.sizeEstimate;
+    const h264 = formatBytes(s.h264BytesPerMin) + '/min';
+    const hevc = formatBytes(s.hevcBytesPerMin) + '/min';
+    const extra = enc.codecs && enc.codecs.some((c) => c.value === 'hevc')
+      ? ` H.265 ≈ ${hevc} (about ${Math.max(1, Math.round((s.hevcBytesPerMin / Math.max(1, s.h264BytesPerMin)) * 100))}% of H.264).`
+      : '';
+    codecSizeHint.textContent = `H.264 ≈ ${h264}.${extra} Current: ${formatBytes(s.currentBytesPerMin)}/min.`;
+  }
+  if (spaceSavingDesc) {
+    const codec = (enc.videoCodec || 'h264');
+    if (codec === 'hevc') {
+      spaceSavingDesc.textContent = 'H.265 is on. Smaller Files lowers bitrate further on top of HEVC.';
+    } else if (codec === 'av1') {
+      spaceSavingDesc.textContent = 'AV1 is on. Smaller Files lowers bitrate further.';
+    } else {
+      spaceSavingDesc.textContent = 'Lower H.264 bitrate. H.265 in Settings is the real space saver when your GPU supports it.';
+    }
+  }
+  if (enc.replay) applyReplayRamCap(enc.replay.maxMinutes, enc.replay.estimatedRamBytes);
+}
+
+function fillWizard(hw) {
+  const wizard = document.getElementById('hwWizard');
+  if (!wizard || !hw) return;
+  const gpu = document.getElementById('wizardGpu');
+  const vram = document.getElementById('wizardVram');
+  const ram = document.getElementById('wizardRam');
+  const cpu = document.getElementById('wizardCpu');
+  const lead = document.getElementById('wizardLead');
+  const tierWrap = document.getElementById('wizardTierWrap');
+  const tierEl = document.getElementById('wizardTier');
+  const defaultsEl = document.getElementById('wizardDefaults');
+  const accept = document.getElementById('wizardAccept');
+  const customize = document.getElementById('wizardCustomize');
+  if (gpu) gpu.textContent = hw.gpuName || 'Unknown GPU';
+  if (vram) vram.textContent = gbLabel(hw.vramBytes);
+  if (ram) ram.textContent = gbLabel(hw.ramBytes);
+  if (cpu) cpu.textContent = `${hw.cpuCores || '?'} threads`;
+  const tierName = hw.tier === 'low' ? 'Low' : hw.tier === 'high' ? 'High' : 'Mid';
+  if (tierEl) tierEl.textContent = tierName;
+  const d = hw.defaults || {};
+  const res = d.outputResolution === 'native' ? 'native' : `${d.outputResolution}p`;
+  if (defaultsEl) {
+    defaultsEl.textContent = `Defaults: ${res} · ${d.fps || 30} fps · ${d.instantReplayMinutes || 2} min replay · ${(d.videoCodec || 'h264').toUpperCase()}`;
+  }
+  if (lead) {
+    lead.textContent = hw.encodersProbed && hw.encoder && hw.encoder.selected
+      ? `Using ${hw.encoder.selected.label}. Accept the defaults for this PC, or customize.`
+      : 'Detecting encoders…';
+  }
+  if (tierWrap) tierWrap.hidden = false;
+  const encReady = Boolean(hw.encodersProbed);
+  if (accept) accept.disabled = !encReady;
+  if (customize) customize.disabled = !encReady;
+}
+
+function showWizard(show) {
+  const wizard = document.getElementById('hwWizard');
+  if (!wizard) return;
+  wizard.hidden = !show;
+  document.body.classList.toggle('wizard-open', Boolean(show));
+}
+
+async function maybeShowWizard(hw) {
+  if (hw && hw.wizardCompleted) {
+    showWizard(false);
+    return;
+  }
+  showWizard(true);
+  fillWizard(hw || {});
 }
 
 function formatClipDate(ms) {
@@ -170,10 +397,10 @@ function renderReplay(replay, isRecording) {
 
   if (replay && replay.active) {
     replayIndicator.hidden = false;
-    const filled = replay.bufferSeconds
-      ? ` · ~${Math.min(replay.bufferSeconds, (replay.minutes || 5) * 60)}s buffered`
-      : '';
-    replayIndicatorText.textContent = `Buffer live${filled}`;
+    const fill = replay.fillPercent != null ? ` · ${replay.fillPercent}%` : '';
+    const marks = replay.bookmarkCount ? ` · ${replay.bookmarkCount} mark${replay.bookmarkCount === 1 ? '' : 's'}` : '';
+    const last = replay.lastSaveOk === false ? ' · last save failed' : '';
+    replayIndicatorText.textContent = `Buffer live${fill}${marks}${last}`;
   } else if (replay && replay.enabled && !replay.active) {
     replayIndicator.hidden = false;
     replayIndicatorText.textContent = 'Waiting for game…';
@@ -182,6 +409,9 @@ function renderReplay(replay, isRecording) {
   }
 
   if (replayNote) replayNote.textContent = 'Stay in the game and press Ctrl+Shift+I to save a clip.';
+  if (replay && (replay.maxMinutes || replay.estimatedRamBytes)) {
+    applyReplayRamCap(replay.maxMinutes, replay.estimatedRamBytes);
+  }
 }
 
 function updateFpsDisplay(state) {
@@ -203,7 +433,8 @@ function updateFpsDisplay(state) {
 
 function updateAudioDisplay(state) {
   if (!audioDisplay || !audioSep) return;
-  if (state && (state.isRecording || (state.instantReplay && state.instantReplay.active))) {
+  const show = Boolean(state && (state.isRecording || (state.instantReplay && state.instantReplay.active)));
+  if (show) {
     audioSep.hidden = false;
     audioDisplay.hidden = false;
     if (state.audioLive) {
@@ -223,6 +454,16 @@ function updateAudioDisplay(state) {
     audioDisplay.hidden = true;
     audioDisplay.textContent = '';
     audioDisplay.classList.remove('audio-live', 'audio-off');
+  }
+  if (audioMeters) {
+    const rec = Boolean(state && state.isRecording);
+    audioMeters.hidden = !rec;
+    if (rec) {
+      const game = Math.max(0, Math.min(1, Number(state.loopbackPeak) || (state.audioLive ? Number(state.audioPeak) || 0 : 0)));
+      const mic = Math.max(0, Math.min(1, Number(state.micPeak) || 0));
+      if (gameLevelFill) gameLevelFill.style.width = `${Math.round(game * 100)}%`;
+      if (micLevelFill) micLevelFill.style.width = `${Math.round(mic * 100)}%`;
+    }
   }
 }
 
@@ -282,11 +523,13 @@ function applyHotkeys(h) {
   currentHotkeys = {
     hotkey: h.hotkey || currentHotkeys.hotkey,
     pauseHotkey: h.pauseHotkey || currentHotkeys.pauseHotkey,
-    replayHotkey: h.replayHotkey || currentHotkeys.replayHotkey
+    replayHotkey: h.replayHotkey || currentHotkeys.replayHotkey,
+    bookmarkHotkey: h.bookmarkHotkey || currentHotkeys.bookmarkHotkey
   };
   setHotkeyKeys('hotkey', currentHotkeys.hotkey);
   setHotkeyKeys('pauseHotkey', currentHotkeys.pauseHotkey);
   setHotkeyKeys('replayHotkey', currentHotkeys.replayHotkey);
+  setHotkeyKeys('bookmarkHotkey', currentHotkeys.bookmarkHotkey);
   if (recKeyHint) recKeyHint.innerHTML = hotkeyToKbd(currentHotkeys.hotkey);
   if (clipKeyHint) clipKeyHint.innerHTML = hotkeyToKbd(currentHotkeys.replayHotkey);
 }
@@ -379,6 +622,7 @@ async function refreshClips() {
         <span>${formatBytes(file.size)}</span>
         <span>${formatClipDate(file.mtime)}</span>
         <button type="button" class="clip-show" data-index="${index}">Show</button>
+        <button type="button" class="clip-show clip-trim-btn" data-index="${index}">Trim</button>
       </div>
     </div>
   `).join('');
@@ -517,7 +761,12 @@ async function loadAudioDevices(preferred) {
   const selected = preferred || payload.preferred || '';
   setSelectOptions(audioDeviceSelect, items, selected);
   if (audioHint) {
-    audioHint.textContent = payload.hint || 'If game sound is missing, install VB-Audio Cable or enable Stereo Mix.';
+    if (payload.hint) audioHint.textContent = payload.hint;
+  }
+  if (audioDiag) {
+    const warn = Boolean(payload.warning || (payload.probe && payload.probe.warning));
+    audioDiag.hidden = !warn;
+    if (warn) audioDiag.textContent = payload.hint || (payload.probe && payload.probe.hint) || 'No usable game-audio loopback was found.';
   }
 }
 
@@ -534,13 +783,26 @@ async function init() {
   instantReplayToggle.checked = Boolean(settings.instantReplayEnabled);
   if (replaySaveSelect) replaySaveSelect.value = String(settings.instantReplaySaveMinutes || 2);
   if (replayBufferSelect) replayBufferSelect.value = String(settings.instantReplayMinutes || 5);
-  if (fpsSelect) fpsSelect.value = String(Number(settings.fps) === 60 ? 60 : 30);
+  if (fpsSelect) fpsSelect.value = String([30, 60, 144].includes(Number(settings.fps)) ? Number(settings.fps) : 30);
+  if (resolutionSelect) resolutionSelect.value = settings.outputResolution || 'native';
+  if (encoderSelect) encoderSelect.value = settings.encoder || 'auto';
+  if (codecSelect) codecSelect.value = settings.videoCodec || 'h264';
+  if (diskSpaceSelect) diskSpaceSelect.value = String(settings.diskSpaceLimitMb || 500);
   if (gameModeToggle) gameModeToggle.checked = settings.gameMode !== false;
   if (exclusiveFullscreenToggle) exclusiveFullscreenToggle.checked = Boolean(settings.exclusiveFullscreen);
+  renderUnstableGames(settings.knownUnstableGames);
   if (audioSourceSelect) audioSourceSelect.value = settings.audioSource === 'mic' ? 'mic' : 'system';
   applyHotkeys(settings);
   syncAllSelects();
   await loadAudioDevices(settings.audioDevice);
+
+  try {
+    const hw = await window.recorder.getHardware();
+    applyHardware(hw);
+    await maybeShowWizard(hw);
+  } catch (e) {
+    showWizard(false);
+  }
 
   const state = await window.recorder.getState();
   render(state);
@@ -570,8 +832,18 @@ function render(state) {
 
     if (state.warning) {
       setStatusCopy(state.isPaused ? 'Paused' : 'Recording', state.warning, { warning: true });
+    } else if (state.diskWarning === 'low' || state.diskWarning === 'critical') {
+      const free = formatBytes(state.diskFreeBytes || 0);
+      setStatusCopy(
+        state.isPaused ? 'Paused' : 'Recording',
+        `Disk space low — ${free} free. Recording will stop before the drive fills up.`,
+        { warning: true }
+      );
     } else {
-      setStatusCopy(state.isPaused ? 'Paused' : 'Recording', state.isPaused ? 'Recording paused' : '');
+      const recLine = state.isPaused
+        ? 'Recording paused'
+        : (state.captureTarget === 'game' ? 'Recording fullscreen game' : 'Recording whole desktop');
+      setStatusCopy(state.isPaused ? 'Paused' : 'Recording', recLine);
     }
 
     liveStats.hidden = false;
@@ -613,13 +885,13 @@ function render(state) {
     if (replay.active) {
       statusDot.classList.add('replay');
       statusLine.classList.add('replay');
-      setStatusCopy('Ready to record', 'Replay buffer is live. Press the button to start.');
+      setStatusCopy('Ready to record', 'Replay buffer is live. Start to record the whole desktop.');
     } else {
       statusDot.classList.remove('replay');
       statusLine.classList.remove('replay');
       setStatusCopy(
         'Ready to record',
-        state.file ? 'Clip saved' : 'Everything is set. Press the button to start.'
+        state.file ? 'Clip saved' : 'Ready. Start to record the whole desktop — games and any software.'
       );
     }
 
@@ -627,12 +899,14 @@ function render(state) {
   }
   wasRecording = Boolean(state.isRecording);
 
+  renderDiskBanner(state);
   renderReplay(replay, state.isRecording);
   updatePttUi(state);
   applyHotkeys({
     hotkey: state.hotkey || currentHotkeys.hotkey,
     pauseHotkey: state.pauseHotkey || currentHotkeys.pauseHotkey,
-    replayHotkey: state.replayHotkey || currentHotkeys.replayHotkey
+    replayHotkey: state.replayHotkey || currentHotkeys.replayHotkey,
+    bookmarkHotkey: state.bookmarkHotkey || currentHotkeys.bookmarkHotkey
   });
 }
 
@@ -678,7 +952,8 @@ replaySaveSelect.addEventListener('change', async () => {
 
 if (replayBufferSelect) {
   replayBufferSelect.addEventListener('change', async () => {
-    await window.recorder.saveSettings({ instantReplayMinutes: Number(replayBufferSelect.value) });
+    const saved = await window.recorder.saveSettings({ instantReplayMinutes: Number(replayBufferSelect.value) });
+    if (saved && saved.hardware) applyHardware(saved.hardware);
   });
 }
 
@@ -710,8 +985,9 @@ saveReplayBtn.addEventListener('click', async () => {
   refreshClips();
 });
 
-spaceSaving.addEventListener('change', () => {
-  window.recorder.saveSettings({ spaceSaving: spaceSaving.checked });
+spaceSaving.addEventListener('change', async () => {
+  const saved = await window.recorder.saveSettings({ spaceSaving: spaceSaving.checked });
+  if (saved && saved.hardware) applyHardware(saved.hardware);
 });
 
 recordAudio.addEventListener('change', () => {
@@ -725,10 +1001,36 @@ if (drawMouse) {
 }
 
 if (fpsSelect) {
-  fpsSelect.addEventListener('change', () => {
-    const fps = Number(fpsSelect.value) === 60 ? 60 : 30;
-    window.recorder.saveSettings({ fps, instantReplayFps: Math.min(30, fps) });
+  fpsSelect.addEventListener('change', async () => {
+    const raw = Number(fpsSelect.value);
+    const fps = raw === 144 || raw === 60 ? raw : 30;
+    const saved = await window.recorder.saveSettings({ fps, instantReplayFps: Math.min(30, fps) });
     syncSelectUI(fpsSelect);
+    if (saved && saved.hardware) applyHardware(saved.hardware);
+  });
+}
+
+if (resolutionSelect) {
+  resolutionSelect.addEventListener('change', async () => {
+    const saved = await window.recorder.saveSettings({ outputResolution: resolutionSelect.value });
+    syncSelectUI(resolutionSelect);
+    if (saved && saved.hardware) applyHardware(saved.hardware);
+  });
+}
+
+if (encoderSelect) {
+  encoderSelect.addEventListener('change', async () => {
+    const saved = await window.recorder.saveSettings({ encoder: encoderSelect.value });
+    syncSelectUI(encoderSelect);
+    if (saved && saved.hardware) applyHardware(saved.hardware);
+  });
+}
+
+if (codecSelect) {
+  codecSelect.addEventListener('change', async () => {
+    const saved = await window.recorder.saveSettings({ videoCodec: codecSelect.value });
+    syncSelectUI(codecSelect);
+    if (saved && saved.hardware) applyHardware(saved.hardware);
   });
 }
 
@@ -741,6 +1043,13 @@ if (gameModeToggle) {
 if (exclusiveFullscreenToggle) {
   exclusiveFullscreenToggle.addEventListener('change', () => {
     window.recorder.saveSettings({ exclusiveFullscreen: exclusiveFullscreenToggle.checked });
+  });
+}
+
+if (diskSpaceSelect) {
+  diskSpaceSelect.addEventListener('change', () => {
+    window.recorder.saveSettings({ diskSpaceLimitMb: Number(diskSpaceSelect.value) || 500 });
+    syncSelectUI(diskSpaceSelect);
   });
 }
 
@@ -790,6 +1099,36 @@ document.querySelectorAll('.js-folder-btn').forEach((btn) => {
   btn.addEventListener('click', chooseFolder);
 });
 
+if (testAudioBtn) {
+  testAudioBtn.addEventListener('click', async () => {
+    testAudioBtn.disabled = true;
+    if (testAudioStatus) testAudioStatus.textContent = 'Recording 3 seconds… play something.';
+    if (testAudioPlayer) {
+      testAudioPlayer.hidden = true;
+      testAudioPlayer.removeAttribute('src');
+    }
+    try {
+      const result = await window.recorder.testAudio();
+      if (!result || !result.ok) {
+        if (testAudioStatus) testAudioStatus.textContent = (result && result.error) || 'Audio test failed.';
+        if (audioDiag && result && result.hint) {
+          audioDiag.hidden = false;
+          audioDiag.textContent = result.hint;
+        }
+        return;
+      }
+      if (testAudioStatus) testAudioStatus.textContent = result.hint || 'Playing back the test clip.';
+      if (testAudioPlayer && result.url) {
+        testAudioPlayer.hidden = false;
+        testAudioPlayer.src = result.url;
+        try { await testAudioPlayer.play(); } catch (e) { /* user gesture already happened */ }
+      }
+    } finally {
+      testAudioBtn.disabled = false;
+    }
+  });
+}
+
 if (openFolderBtn) openFolderBtn.addEventListener('click', () => window.recorder.openFolder());
 document.querySelectorAll('.js-open-folder').forEach((btn) => {
   btn.addEventListener('click', () => window.recorder.openFolder());
@@ -807,10 +1146,11 @@ async function resetHotkeys() {
   const saved = await window.recorder.saveSettings({
     hotkey: 'CommandOrControl+Shift+R',
     pauseHotkey: 'CommandOrControl+Shift+P',
-    replayHotkey: 'CommandOrControl+Shift+I'
+    replayHotkey: 'CommandOrControl+Shift+I',
+    bookmarkHotkey: 'CommandOrControl+Shift+B'
   });
   applyHotkeys(saved);
-  setHotkeyNotes('Hotkeys reset to Ctrl+Shift+R / P / I.', true);
+  setHotkeyNotes('Hotkeys reset to Ctrl+Shift+R / P / I / B.', true);
 }
 
 if (hotkeyReset) hotkeyReset.addEventListener('click', resetHotkeys);
@@ -825,6 +1165,12 @@ document.querySelectorAll('[data-nav]').forEach((btn) => {
 if (clipsList) {
   clipsList.addEventListener('click', async (e) => {
     const showBtn = e.target.closest('.clip-show');
+    if (showBtn && showBtn.classList.contains('clip-trim-btn')) {
+      e.stopPropagation();
+      const file = clipFiles[Number(showBtn.dataset.index)];
+      if (file) openTrimPanel(file);
+      return;
+    }
     if (showBtn) {
       e.stopPropagation();
       const file = clipFiles[Number(showBtn.dataset.index)];
@@ -875,5 +1221,132 @@ window.addEventListener('blur', () => {
 });
 
 window.recorder.onStateChange((state) => render(state));
+if (window.recorder.onNotice) {
+  window.recorder.onNotice((payload) => {
+    const msg = payload && payload.message ? payload.message : payload;
+    showAppNotice(msg);
+    if (String(msg || '').toLowerCase().includes('recovered')) refreshClips();
+  });
+}
+if (window.recorder.onHardwareReady) {
+  window.recorder.onHardwareReady((hw) => {
+    applyHardware(hw);
+    maybeShowWizard(hw);
+  });
+}
+
+const wizardAccept = document.getElementById('wizardAccept');
+const wizardCustomize = document.getElementById('wizardCustomize');
+if (wizardAccept) {
+  wizardAccept.addEventListener('click', async () => {
+    wizardAccept.disabled = true;
+    const result = await window.recorder.completeWizard({ customize: false });
+    if (result && result.hardware) applyHardware(result.hardware);
+    if (result && result.settings) {
+      if (fpsSelect) fpsSelect.value = String(result.settings.fps || 30);
+      if (resolutionSelect) resolutionSelect.value = result.settings.outputResolution || 'native';
+      if (codecSelect) codecSelect.value = result.settings.videoCodec || 'h264';
+      if (replayBufferSelect) replayBufferSelect.value = String(result.settings.instantReplayMinutes || 3);
+      if (spaceSaving) spaceSaving.checked = result.settings.spaceSaving !== false;
+      syncAllSelects();
+    }
+    showWizard(false);
+    render(await window.recorder.getState());
+  });
+}
+if (wizardCustomize) {
+  wizardCustomize.addEventListener('click', async () => {
+    wizardCustomize.disabled = true;
+    const result = await window.recorder.completeWizard({ customize: true, settings: {} });
+    if (result && result.hardware) applyHardware(result.hardware);
+    showWizard(false);
+    showView('settings');
+  });
+}
+
+const trimPanel = document.getElementById('trimPanel');
+const trimVideo = document.getElementById('trimVideo');
+const trimStart = document.getElementById('trimStart');
+const trimEnd = document.getElementById('trimEnd');
+const trimStartLabel = document.getElementById('trimStartLabel');
+const trimEndLabel = document.getElementById('trimEndLabel');
+const trimFileName = document.getElementById('trimFileName');
+const trimExport = document.getElementById('trimExport');
+const trimCancel = document.getElementById('trimCancel');
+const trimPrecise = document.getElementById('trimPrecise');
+
+function syncTrimLabels() {
+  if (!trimStart || !trimEnd) return;
+  let a = Number(trimStart.value);
+  let b = Number(trimEnd.value);
+  if (a > b) {
+    const t = a; a = b; b = t;
+    trimStart.value = String(a);
+    trimEnd.value = String(b);
+  }
+  if (trimStartLabel) trimStartLabel.textContent = formatClock(a);
+  if (trimEndLabel) trimEndLabel.textContent = formatClock(b);
+}
+
+async function openTrimPanel(file) {
+  if (!trimPanel || !window.recorder.probeRecording) return;
+  trimTarget = file;
+  trimPanel.hidden = false;
+  if (trimFileName) trimFileName.textContent = `Loading ${file.name}…`;
+  const probed = await window.recorder.probeRecording(file.path);
+  if (!probed || !probed.ok) {
+    if (trimFileName) trimFileName.textContent = (probed && probed.error) || 'Could not open that clip.';
+    return;
+  }
+  trimTarget = { ...file, duration: probed.duration, url: probed.url };
+  const dur = Math.max(1, Number(probed.duration) || 1);
+  if (trimStart) { trimStart.min = '0'; trimStart.max = String(dur); trimStart.value = '0'; }
+  if (trimEnd) { trimEnd.min = '0'; trimEnd.max = String(dur); trimEnd.value = String(dur); }
+  if (trimFileName) trimFileName.textContent = probed.name;
+  if (trimVideo) {
+    trimVideo.src = probed.url;
+    trimVideo.load();
+  }
+  syncTrimLabels();
+}
+
+if (trimStart) trimStart.addEventListener('input', () => {
+  syncTrimLabels();
+  if (trimVideo) trimVideo.currentTime = Number(trimStart.value) || 0;
+});
+if (trimEnd) trimEnd.addEventListener('input', () => {
+  syncTrimLabels();
+  if (trimVideo) trimVideo.currentTime = Number(trimEnd.value) || 0;
+});
+if (trimCancel) {
+  trimCancel.addEventListener('click', () => {
+    trimPanel.hidden = true;
+    if (trimVideo) trimVideo.removeAttribute('src');
+    trimTarget = null;
+  });
+}
+if (trimExport) {
+  trimExport.addEventListener('click', async () => {
+    if (!trimTarget) return;
+    trimExport.disabled = true;
+    trimExport.textContent = 'Exporting…';
+    const startSec = Math.min(Number(trimStart.value), Number(trimEnd.value));
+    const endSec = Math.max(Number(trimStart.value), Number(trimEnd.value));
+    const result = await window.recorder.trimRecording({
+      filePath: trimTarget.path,
+      startSec,
+      endSec,
+      precise: Boolean(trimPrecise && trimPrecise.checked)
+    });
+    trimExport.disabled = false;
+    trimExport.textContent = 'Export Trimmed Clip';
+    if (!result || !result.ok) {
+      if (trimFileName) trimFileName.textContent = (result && result.error) || 'Trim failed.';
+      return;
+    }
+    if (trimFileName) trimFileName.textContent = `Saved ${result.name}`;
+    refreshClips();
+  });
+}
 
 init();
