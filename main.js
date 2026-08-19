@@ -134,7 +134,8 @@ let ffmpegCaps = {
   hasH264Qsv: false,
   hasHevcQsv: false,
   hasAv1Qsv: false,
-  hasWasapi: false
+  hasWasapi: false,
+  ddagrabHasDrawBorder: false
 };
 
 /** GPU / RAM / CPU snapshot + the encoder that was actually selected. */
@@ -1419,6 +1420,7 @@ function probeFfmpeg() {
     hasHevcQsv: false,
     hasAv1Qsv: false,
     hasWasapi: false,
+    ddagrabHasDrawBorder: false,
     probeError: null
   };
 
@@ -1438,6 +1440,16 @@ function probeFfmpeg() {
   } catch (e) {
     const out = `${e.stdout || ''}${e.stderr || ''}`;
     caps.hasDdagrab = /\bddagrab\b/i.test(out);
+  }
+  caps.ddagrabHasDrawBorder = false;
+  if (caps.hasDdagrab) {
+    try {
+      runFfmpeg(['-hide_banner', '-f', 'lavfi', '-i', 'ddagrab=framerate=1:draw_border=0', '-t', '0.1', '-f', 'null', '-'], 8000);
+      caps.ddagrabHasDrawBorder = true;
+    } catch (e) {
+      const err = `${e.stderr || ''}${e.stdout || ''}${e.message || ''}`;
+      caps.ddagrabHasDrawBorder = !/not.found|non-existent option/i.test(err);
+    }
   }
 
   let listedEncoders = '';
@@ -1639,16 +1651,14 @@ function pushDesktopCaptureArgs(args, { fps, useDdagrab }) {
   const mouse = drawMouseFlag();
   const game = Boolean(settings.gameMode);
   if (useDdagrab && ffmpegCaps.hasDdagrab) {
-    // Bigger queues = fewer underruns / hitchy fps during fast motion
     if (game) {
       args.push('-probesize', '42M', '-analyzeduration', '0', '-thread_queue_size', '1024');
     } else {
       args.push('-thread_queue_size', '256');
     }
-    args.push(
-      '-f', 'lavfi',
-      '-i', `ddagrab=framerate=${fps}:output_idx=0:draw_mouse=${mouse}:draw_border=0:dup_frames=1`
-    );
+    let ddaOpts = `ddagrab=framerate=${fps}:output_idx=0:draw_mouse=${mouse}:dup_frames=1`;
+    if (ffmpegCaps.ddagrabHasDrawBorder) ddaOpts += ':draw_border=0';
+    args.push('-f', 'lavfi', '-i', ddaOpts);
   } else {
     args.push(
       '-thread_queue_size', game ? '1024' : '256',
@@ -3024,6 +3034,12 @@ function launchSegment() {
 
     if (session.useDdagrab && isDdagrabFailure(msg)) {
       fallbackStage = 1;
+      if (/not.found|non-existent option/i.test(msg)) {
+        console.warn('ddagrab options unsupported; falling back to gdigrab.');
+        session.useDdagrab = false;
+        restartCurrentSegment();
+        return;
+      }
       console.warn('ddagrab lost the display; retrying capture in 1.5s.');
       setTimeout(() => {
         if (isRecording && !isPaused && session && session.intent === 'running') {

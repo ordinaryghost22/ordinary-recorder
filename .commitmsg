@@ -1,0 +1,6 @@
+fix: remove unsupported ddagrab draw_border option that broke recording
+
+FFmpeg 8.1.2 removed the draw_border option from ddagrab, causing
+every recording attempt to fail with "Option not found". Now probes
+for draw_border support at startup and omits it when unavailable.
+Also improves fallback to gdigrab on ddagrab option errors.
