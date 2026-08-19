@@ -42,7 +42,7 @@ app.commandLine.appendSwitch('enable-features',
   'WebRtcAllowWgcScreenCapturer,WebRtcAllowWgcWindowCapturer,AllowWgcScreenCapturer,AllowWgcWindowCapturer,WebCodecs'
 );
 app.commandLine.appendSwitch('allow-file-access-from-files');
-app.commandLine.appendSwitch('disable-features', 'ScreenCaptureIndicator');
+app.commandLine.appendSwitch('disable-features', 'ScreenCaptureIndicator,TabCaptureIndicator,ScreenCaptureKitMac');
 
 let mainWindow = null;
 let tray = null;
@@ -5080,17 +5080,10 @@ async function startRecording() {
       session.micDevice = micDevice;
       appendDiagnosticsLine(`Audio: using WASAPI loopback (${describeAudioRoute()})`);
     } else {
-      try {
-        loopback = await startLoopbackCapture(sessionFolder);
-      } catch (e) {
-        loopback = { ok: false, error: e.message || String(e) };
-      }
-      if (loopback.ok) {
-        console.log('Recording desktop audio from speakers/headphones (loopback).');
-        appendDiagnosticsLine(`Audio: Chromium loopback (${describeAudioRoute()})`);
-      } else {
-        console.warn('Loopback audio failed, trying DirectShow:', loopback.error);
-        let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
+      let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
+      const hasDshowSystem = Boolean(audioDevice && !isMicrophoneDevice(audioDevice));
+
+      if (hasDshowSystem) {
         if (audioDevice && audioDevice !== settings.audioDevice) {
           settings.audioDevice = audioDevice;
           saveSettings(settings);
@@ -5098,22 +5091,47 @@ async function startRecording() {
         session.audioDevice = audioDevice;
         session.micDevice = (
           settings.audioSource !== 'mic' &&
-          settings.pttEnabled !== true &&
-          audioDevice &&
-          !isMicrophoneDevice(audioDevice)
+          settings.pttEnabled !== true
         ) ? pickMicrophoneDevice(devices) : micDevice;
         session.useLoopback = false;
-        session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
-        appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
-        maybeExplainAudioFallback();
-        if (!audioDevice && !session.useWasapi) {
-          notifyUser('No game audio source — recording will be silent');
+        session.useWasapi = false;
+        appendDiagnosticsLine(`Audio: DirectShow device=${audioDevice} (${describeAudioRoute()})`);
+      } else {
+        try {
+          loopback = await startLoopbackCapture(sessionFolder);
+        } catch (e) {
+          loopback = { ok: false, error: e.message || String(e) };
+        }
+        if (loopback.ok) {
+          console.log('Recording desktop audio from speakers/headphones (loopback).');
+          appendDiagnosticsLine(`Audio: Chromium loopback (${describeAudioRoute()})`);
+        } else {
+          console.warn('Loopback audio failed, trying DirectShow:', loopback.error);
+          audioDevice = audioDevice || resolveAudioDevice(devices);
+          if (audioDevice && audioDevice !== settings.audioDevice) {
+            settings.audioDevice = audioDevice;
+            saveSettings(settings);
+          }
+          session.audioDevice = audioDevice;
+          session.micDevice = (
+            settings.audioSource !== 'mic' &&
+            settings.pttEnabled !== true &&
+            audioDevice &&
+            !isMicrophoneDevice(audioDevice)
+          ) ? pickMicrophoneDevice(devices) : micDevice;
+          session.useLoopback = false;
+          session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
+          appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
           maybeExplainAudioFallback();
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('recording-state', {
-              ...getStatePayload(),
-              warning: audioProbe.hint
-            });
+          if (!audioDevice && !session.useWasapi) {
+            notifyUser('No game audio source — recording will be silent');
+            maybeExplainAudioFallback();
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('recording-state', {
+                ...getStatePayload(),
+                warning: audioProbe.hint
+              });
+            }
           }
         }
       }
