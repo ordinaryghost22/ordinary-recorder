@@ -43,6 +43,7 @@ const spaceSavingDesc = document.getElementById('spaceSavingDesc');
 const replayRamHint = document.getElementById('replayRamHint');
 const audioSourceSelect = document.getElementById('audioSourceSelect');
 const audioDeviceSelect = document.getElementById('audioDeviceSelect');
+const audioDeviceRow = document.getElementById('audioDeviceRow');
 const audioHint = document.getElementById('audioHint');
 const saveReplayBtn = document.getElementById('saveReplayBtn');
 const saveReplayLabel = document.getElementById('saveReplayLabel');
@@ -397,9 +398,14 @@ function renderReplay(replay, isRecording) {
 
   if (replay && replay.active) {
     replayIndicator.hidden = false;
-    const fill = replay.fillPercent != null ? ` · ${replay.fillPercent}%` : '';
+    const fillPct = replay.fillPercent != null ? replay.fillPercent : null;
+    const fill = fillPct != null ? ` · ${fillPct}%` : '';
     const marks = replay.bookmarkCount ? ` · ${replay.bookmarkCount} mark${replay.bookmarkCount === 1 ? '' : 's'}` : '';
-    const last = replay.lastSaveOk === false ? ' · last save failed' : '';
+    const last = replay.lastSaveOk === false
+      ? ' · last save failed'
+      : (replay.lastSaveOk === true && replay.lastSaveAt
+        ? ` · last save ok`
+        : '');
     replayIndicatorText.textContent = `Buffer live${fill}${marks}${last}`;
   } else if (replay && replay.enabled && !replay.active) {
     replayIndicator.hidden = false;
@@ -760,13 +766,16 @@ async function loadAudioDevices(preferred) {
     : [{ value: '', label: 'No audio device found' }];
   const selected = preferred || payload.preferred || '';
   setSelectOptions(audioDeviceSelect, items, selected);
+  if (audioDeviceRow) {
+    audioDeviceRow.hidden = payload.showDevicePicker !== true;
+  }
   if (audioHint) {
-    if (payload.hint) audioHint.textContent = payload.hint;
+    audioHint.textContent = payload.hint || 'Game sound is captured automatically from your speakers or headphones.';
   }
   if (audioDiag) {
     const warn = Boolean(payload.warning || (payload.probe && payload.probe.warning));
     audioDiag.hidden = !warn;
-    if (warn) audioDiag.textContent = payload.hint || (payload.probe && payload.probe.hint) || 'No usable game-audio loopback was found.';
+    if (warn) audioDiag.textContent = payload.hint || (payload.probe && payload.probe.hint) || '';
   }
 }
 

@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('recorder', {
   saveReplay: (saveMinutes) => ipcRenderer.invoke('save-instant-replay', saveMinutes),
   getInstantReplayState: () => ipcRenderer.invoke('get-instant-replay-state'),
   getState: () => ipcRenderer.invoke('get-state'),
+  getDiagnostics: () => ipcRenderer.invoke('get-diagnostics'),
   chooseFolder: () => ipcRenderer.invoke('choose-folder'),
   openFolder: () => ipcRenderer.invoke('open-folder'),
   listRecordings: () => ipcRenderer.invoke('list-recordings'),

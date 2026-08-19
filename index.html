@@ -580,12 +580,12 @@
 
           <section class="section">
             <h2 class="section-title">Audio</h2>
-            <p class="section-desc">Pick how game sound and voice are captured.</p>
+            <p class="section-desc">Game sound is captured automatically. Press Test Audio to confirm.</p>
             <div class="settings-surface">
               <div class="setting-row">
                 <div class="row-copy">
                   <div class="row-label">Audio Source</div>
-                  <div class="row-desc">Desktop sound is captured from what you hear</div>
+                  <div class="row-desc">What you hear, plus your microphone</div>
                 </div>
                 <div class="select-wrap">
                   <select id="audioSourceSelect" tabindex="-1" aria-hidden="true">
@@ -602,10 +602,10 @@
                   </div>
                 </div>
               </div>
-              <div class="setting-row">
+              <div class="setting-row" id="audioDeviceRow" hidden>
                 <div class="row-copy">
-                  <div class="row-label">Audio Device</div>
-                  <div class="row-desc">Fallback only. WASAPI loopback is used when it works</div>
+                  <div class="row-label">Backup audio device</div>
+                  <div class="row-desc">Only needed if Test Audio is silent</div>
                 </div>
                 <div class="select-wrap">
                   <select id="audioDeviceSelect" tabindex="-1" aria-hidden="true">
@@ -624,10 +624,10 @@
             <div class="audio-diag" id="audioDiag" hidden></div>
             <div class="audio-test-row">
               <button type="button" class="btn-secondary" id="testAudioBtn">Test Audio</button>
-              <span class="replay-note" id="testAudioStatus">Records 3 seconds of game audio + mic and plays it back.</span>
+              <span class="replay-note" id="testAudioStatus">Play a game or a video, then press Test. You should hear game sound and your mic.</span>
             </div>
             <audio id="testAudioPlayer" controls hidden></audio>
-            <p class="replay-note" id="audioHint">Desktop sound is recorded from your speakers or headphones. Keep Game Audio on.</p>
+            <p class="replay-note" id="audioHint">Game sound is captured automatically from your speakers or headphones.</p>
           </section>
 
           <section class="section">

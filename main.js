@@ -4,6 +4,11 @@ const fs = require('fs');
 const os = require('os');
 const { pathToFileURL } = require('url');
 const { spawn, spawnSync, execSync } = require('child_process');
+const { createRecState } = require('./engine/rec-state');
+const { createDiag } = require('./engine/diag');
+const { friendlyError, userFacing } = require('./engine/errors');
+const { verifyOutputBasics, verifyFromFfmpegProbe, parseDurationSeconds } = require('./engine/verify');
+const { createDebouncer, createJobQueue, shouldRetestUnstableGame, canRecoverCandidate } = require('./engine/guards');
 
 // Only one instance — many copies steal hotkeys and break recording
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -105,6 +110,9 @@ const medal = {
 
 let powerSaveId = null;
 let lastAudioPeak = 0;
+let lastMediaTickAt = 0;
+let captureUnhealthy = false;
+let captureRecoverTries = 0;
 let gameWatchTimer = null;
 let desktopGameWatchTimer = null;
 let retargetingCapture = false;
@@ -179,7 +187,8 @@ const defaultSettings = {
   wizardCompleted: false,
   hardwareProfile: null,
   diskSpaceLimitMb: 500,
-  knownUnstableGames: []
+  knownUnstableGames: [],
+  audioFallbackNoticeShown: false
 };
 
 function loadSettings() {
@@ -269,7 +278,11 @@ function loadSettings() {
 }
 
 function saveSettings(next) {
-  fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2));
+  try {
+    fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2));
+  } catch (e) {
+    diag.error('STORAGE', 'Could not save settings', { err: e.message || String(e) });
+  }
 }
 
 let pttProc = null;
@@ -340,6 +353,14 @@ let lastAudioDeviceSnapshot = '';
 let audioSwitchInFlight = false;
 let replayBookmarks = [];
 let lastReplaySave = { ok: null, at: 0, error: null, file: null };
+let replayBufferStartedAt = 0;
+const hotkeyDebounce = {
+  rec: createDebouncer(400),
+  pause: createDebouncer(350),
+  clip: createDebouncer(450),
+  mark: createDebouncer(180)
+};
+const replaySaveQueue = createJobQueue();
 let audioProbe = {
   devices: [],
   wasapiListed: false,
@@ -367,7 +388,9 @@ function ffmpegCandidatePaths() {
       const exeDir = path.dirname(app.getPath('exe'));
       candidates.push(path.join(exeDir, 'resources', 'ffmpeg', 'ffmpeg.exe'));
       candidates.push(path.join(exeDir, 'ffmpeg', 'ffmpeg.exe'));
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      console.warn('Could not resolve exe dir for ffmpeg search:', e.message || e);
+    }
   }
 
   // Dev / fallback
@@ -587,22 +610,25 @@ function probeWasapiLoopback() {
   if (!ffmpegCaps.available || !ffmpegCaps.hasWasapi) return false;
   const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
   if (!ffmpegPath) return false;
-  try {
-    runFfmpegArgv(ffmpegPath, [
-      '-hide_banner', '-nostdin', '-loglevel', 'error',
-      '-f', 'wasapi', '-i', 'loopback',
-      '-t', '0.3', '-f', 'null', '-'
-    ], 8000);
-    return true;
-  } catch (e) {
-    const err = `${e.stderr || ''}${e.stdout || ''}${e.message || ''}`;
-    if (/IAudioClient|Unknown input format|Could not find|not found|No such device/i.test(err) && !/frame=\s*[1-9]/i.test(err)) {
-      return false;
+  const attempts = [
+    ['-f', 'wasapi', '-i', 'loopback'],
+    ['-f', 'wasapi', '-loopback', '1', '-i', 'default']
+  ];
+  for (const extra of attempts) {
+    try {
+      runFfmpegArgv(ffmpegPath, [
+        '-hide_banner', '-nostdin', '-loglevel', 'error',
+        ...extra,
+        '-t', '0.3', '-f', 'null', '-'
+      ], 8000);
+      return true;
+    } catch (e) {
+      const err = `${e.stderr || ''}${e.stdout || ''}${e.message || ''}`;
+      if (/frame=\s*[1-9]|size=\s*[1-9]/i.test(err)) return true;
+      console.warn('WASAPI loopback probe failed:', extra.join(' '), err.slice(0, 180));
     }
-    if (/frame=\s*[1-9]|size=\s*[1-9]/i.test(err)) return true;
-    console.warn('WASAPI loopback probe failed:', err.slice(0, 240));
-    return false;
   }
+  return false;
 }
 
 function refreshAudioProbe({ testWasapi = false } = {}) {
@@ -617,20 +643,20 @@ function refreshAudioProbe({ testWasapi = false } = {}) {
   if (audioProbe.wasapiWorks) loopbackKind = 'wasapi';
   else if (virtualCable) loopbackKind = 'vb-cable';
   else if (stereoMix) loopbackKind = 'stereo-mix';
-  const warning = settings.recordAudio && settings.audioSource !== 'mic' && loopbackKind === 'none';
+  const warning = settings.recordAudio && settings.audioSource !== 'mic' && loopbackKind !== 'wasapi';
   let hint;
   if (!settings.recordAudio) {
-    hint = 'Game audio is off. Turn it on in Settings if you want what you hear in the recording.';
+    hint = 'Game audio is off.';
   } else if (settings.audioSource === 'mic') {
-    hint = 'Microphone only. Game audio is not captured.';
+    hint = 'Microphone only — what you hear is not recorded.';
   } else if (loopbackKind === 'wasapi') {
-    hint = 'WASAPI loopback is working — game audio is captured from your speakers/headphones. Stereo Mix or a virtual cable is not needed.';
+    hint = 'Game sound is captured automatically from your speakers or headphones. Press Test Audio to confirm.';
   } else if (loopbackKind === 'vb-cable') {
-    hint = `Using virtual cable (${virtualCable}). WASAPI loopback is not available in this FFmpeg build.`;
+    hint = `Couldn't use the normal Windows audio path. Using ${virtualCable} as a backup. Press Test Audio — if it's silent, that backup device isn't receiving game sound.`;
   } else if (loopbackKind === 'stereo-mix') {
-    hint = `Using Stereo Mix (${stereoMix}). WASAPI loopback is not available — enable it in Windows sound settings if this is silent.`;
+    hint = `Couldn't use the normal Windows audio path. Using ${stereoMix} as a backup. Press Test Audio to confirm.`;
   } else {
-    hint = 'No usable game-audio loopback. WASAPI is missing, Stereo Mix is disabled, and no VB-CABLE device was found. Recordings may have no game sound until one of those is available.';
+    hint = 'Couldn\'t capture what you hear. On this PC the normal Windows path failed, and there is no Stereo Mix or virtual cable to fall back to. Enable Stereo Mix in Sound settings (Recording tab → Show Disabled Devices) or install VB-Audio Virtual Cable, then press Test Audio.';
   }
   audioProbe = {
     devices,
@@ -657,6 +683,25 @@ function getAudioSetupHint(devices) {
   return audioProbe.hint;
 }
 
+function maybeExplainAudioFallback() {
+  if (!settings.recordAudio || settings.audioSource === 'mic') return;
+  const p = audioProbe.at ? audioProbe : refreshAudioProbe();
+  if (p.loopbackKind === 'wasapi') return;
+  if (settings.audioFallbackNoticeShown) return;
+  settings.audioFallbackNoticeShown = true;
+  saveSettings(settings);
+  const backup = p.virtualCable || p.stereoMix;
+  dialog.showMessageBox(mainWindow || undefined, {
+    type: 'warning',
+    title: 'Check game audio',
+    message: 'Game sound is usually captured automatically. This PC needs a backup.',
+    detail: backup
+      ? `Test Audio in Settings should still work using ${backup}. Only if that test is silent do you need to change anything.`
+      : 'Press Test Audio in Settings. If you hear nothing, enable Stereo Mix (Sound → Recording → Show Disabled Devices) or install VB-Audio Virtual Cable, then test again.',
+    buttons: ['OK']
+  }).catch(() => {});
+}
+
 function describeAudioRoute() {
   const p = audioProbe.at ? audioProbe : refreshAudioProbe();
   const parts = [
@@ -677,26 +722,22 @@ function audioDeviceSnapshot(devices) {
 function applyAudioDeviceChange(reason, nextDevice) {
   if (!session || audioSwitchInFlight) return false;
   audioSwitchInFlight = true;
-  try {
-    appendDiagnosticsLine(`Audio: ${reason}${nextDevice ? ` → ${nextDevice}` : ' (dropped)'}`);
-    if (nextDevice) {
-      session.audioDevice = nextDevice;
-      session.audioDropped = false;
-      settings.audioDevice = nextDevice;
-      saveSettings(settings);
-      notifyUser(`Audio device changed — now using ${nextDevice}`);
-    } else {
-      session.audioDevice = null;
-      session.micDevice = null;
-      session.audioDropped = true;
-      session.audioOpened = false;
-      notifyUser('Audio source dropped — recording continues without that device');
-    }
-    restartCurrentSegment();
-    return true;
-  } finally {
-    setTimeout(() => { audioSwitchInFlight = false; }, 1500);
+  appendDiagnosticsLine(`Audio: ${reason}${nextDevice ? ` → ${nextDevice}` : ' (dropped)'}`);
+  if (nextDevice) {
+    session.audioDevice = nextDevice;
+    session.audioDropped = false;
+    settings.audioDevice = nextDevice;
+    saveSettings(settings);
+    notifyUser(`Audio device changed — now using ${nextDevice}`);
+  } else {
+    session.audioDevice = null;
+    session.micDevice = null;
+    session.audioDropped = true;
+    session.audioOpened = false;
+    notifyUser('Audio source dropped — recording continues without that device');
   }
+  restartCurrentSegment();
+  return true;
 }
 
 function checkAudioDeviceGuard() {
@@ -739,7 +780,9 @@ function startAudioDevicePolling() {
     lastAudioDeviceSnapshot = '';
   }
   audioWatchTimer = setInterval(() => {
-    try { checkAudioDeviceGuard(); } catch (e) { /* ignore */ }
+    try { checkAudioDeviceGuard(); } catch (e) {
+      diag.warn('AUDIO', 'Device watch failed', { err: e.message || String(e) });
+    }
   }, 4000);
 }
 
@@ -1171,6 +1214,7 @@ function writeDiagnosticsLog() {
     `RAM: ${(hardwareInfo.ramBytes / (1024 ** 3)).toFixed(1)} GB`,
     `CPU: ${hardwareInfo.cpuModel} (${hardwareInfo.cpuCores} threads)`,
     `Tier: ${hardwareInfo.tier}`,
+    `recPhase: ${typeof rec !== 'undefined' ? rec.phase : 'n/a'}`,
     `Other GPUs: ${hardwareInfo.gpus.map((g) => g.name).join(' | ') || '(none)'}`,
     '',
     '-- FFmpeg --',
@@ -1590,7 +1634,7 @@ function pushDesktopCaptureArgs(args, { fps, useDdagrab }) {
     }
     args.push(
       '-f', 'lavfi',
-      '-i', `ddagrab=framerate=${fps}:output_idx=0:draw_mouse=${mouse}:dup_frames=1`
+      '-i', `ddagrab=framerate=${fps}:output_idx=0:draw_mouse=${mouse}:draw_border=0:dup_frames=1`
     );
   } else {
     args.push(
@@ -1861,6 +1905,9 @@ function resetCaptureStats() {
   lastAudioPeak = 0;
   lastLoopbackPeak = 0;
   lastMicPeak = 0;
+  lastMediaTickAt = 0;
+  captureUnhealthy = false;
+  captureRecoverTries = 0;
 }
 
 function surfaceBorderlessWarning() {
@@ -1876,6 +1923,7 @@ function pushCaptureStatsToUi(extra = {}) {
 }
 
 function handleFfmpegProgress(msg) {
+  if (/\bframe=\s*[1-9]|\bfps=\s*[\d.]/.test(msg)) lastMediaTickAt = Date.now();
   const fps = parseLiveFps(msg);
   if (fps != null) {
     liveCaptureFps = fps;
@@ -1913,11 +1961,7 @@ function showMainWindow() {
 }
 
 function friendlyCaptureError(err) {
-  const msg = String(err || '');
-  if (msg === 'WECODECS_UNAVAILABLE' || /webcodecs/i.test(msg)) {
-    return 'Could not start capture. Press Ctrl+Shift+R while the game is in front.';
-  }
-  return msg || 'Could not start recording.';
+  return userFacing(err, 'CAPTURE');
 }
 
 function getElapsedMs() {
@@ -1959,6 +2003,7 @@ function getSessionFileSize() {
 }
 
 function getStatePayload() {
+  const instantReplay = getInstantReplayState();
   return {
     isRecording,
     isPaused,
@@ -1980,13 +2025,9 @@ function getStatePayload() {
     audioLive: Boolean(
       lastAudioPeak > 0.004 ||
       lastLoopbackPeak > 0.004 ||
-      lastMicPeak > 0.004 ||
-      (medal.hasAudio && lastAudioPeak > 0.004) ||
-      (session && session.audioOpened && !session.audioDropped)
+      lastMicPeak > 0.004
     ),
-    loopbackPeak: lastLoopbackPeak > 0
-      ? lastLoopbackPeak
-      : (session && session.useWasapi && session.audioOpened && !session.audioDropped ? 0.22 : 0),
+    loopbackPeak: lastLoopbackPeak,
     micPeak: lastMicPeak,
     audioRoute: audioProbe.loopbackKind || null,
     audioWarning: Boolean(audioProbe.warning),
@@ -1995,12 +2036,18 @@ function getStatePayload() {
     pauseHotkey: settings.pauseHotkey,
     replayHotkey: settings.replayHotkey,
     bookmarkHotkey: settings.bookmarkHotkey,
-    instantReplay: getInstantReplayState(),
+    instantReplay,
     captureTarget: !isRecording ? null : (usingGameCapture || medal.recording ? 'game' : 'desktop'),
     encoder: (hardwareInfo.encoder && hardwareInfo.encoder.label) || null,
     diskFreeBytes: lastDiskFreeBytes,
     diskLimitBytes: diskSpaceLimitBytes(),
     diskWarning: lastDiskWarning,
+    bufferFillPercent: (instantReplay && instantReplay.fillPercent) || 0,
+    lastReplaySaveOk: lastReplaySave.ok,
+    lastReplaySaveAt: lastReplaySave.at,
+    lastReplaySaveError: lastReplaySave.error,
+    recPhase: rec.phase,
+    captureHealthy: Boolean(isRecording && !isPaused && !captureUnhealthy),
     notice: lastAppNotice
   };
 }
@@ -2016,16 +2063,35 @@ function startStatsPolling() {
       return;
     }
     const size = getSessionFileSize();
+    const mediaFresh = lastMediaTickAt && (Date.now() - lastMediaTickAt) < 4000;
     if (!isPaused) {
-      if (size <= lastSize + 2048) stalledChecks += 1;
+      if (size <= lastSize + 2048 && !mediaFresh) stalledChecks += 1;
       else stalledChecks = 0;
       lastSize = size;
-      // After ~6s with no growth, warn via tray/status
-      if (stalledChecks >= 3 && mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('recording-state', {
-          ...getStatePayload(),
-          warning: 'Capture looks empty — if a game is exclusive fullscreen, press the hotkey while that game is in front'
-        });
+      captureUnhealthy = stalledChecks >= 3;
+      if (stalledChecks === 3) {
+        diag.warn('CAPTURE', 'No frames or file growth for ~6s');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('recording-state', {
+            ...getStatePayload(),
+            warning: 'Capture looks empty — if a game is exclusive fullscreen, press the hotkey while that game is in front'
+          });
+        }
+      }
+      if (stalledChecks === 5 && captureRecoverTries < 1 && session && !usingGameCapture && !medal.recording) {
+        captureRecoverTries += 1;
+        diag.warn('CAPTURE', 'Restarting encoder after stall');
+        restartCurrentSegment({ keepPartial: true });
+        stalledChecks = 0;
+        lastSize = getSessionFileSize();
+      } else if (stalledChecks === 8 && captureRecoverTries < 2 && session && !usingGameCapture && !medal.recording && settings.exclusiveFullscreen !== false) {
+        captureRecoverTries += 1;
+        diag.warn('CAPTURE', 'Stall continues — switching to game capture');
+        switchDesktopRecordingToGame().catch((e) => diag.error('CAPTURE', 'WGC fallback failed', { err: e.message || String(e) }));
+      } else if (stalledChecks >= 12 && rec.canStop()) {
+        diag.critical('CAPTURE', 'Capture stayed empty — stopping to preserve what we have');
+        notifyFriendly('No video was captured (0 bytes).', 'CAPTURE');
+        stopRecording().catch((e) => diag.error('CAPTURE', 'Stop after stall failed', { err: e.message || String(e) }));
       }
     }
     broadcastState();
@@ -2079,21 +2145,32 @@ function escapeConcatPath(filePath) {
   return filePath.replace(/\\/g, '/').replace(/'/g, "'\\''");
 }
 
-function concatSegments(segments, outputFile, listDir) {
+function runFfmpegAsync(ffmpegPath, argv, timeoutMs = 300000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, argv, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    const timer = setTimeout(() => {
+      try { proc.kill(); } catch (e) { /* ignore */ }
+      reject(new Error(`ffmpeg timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stderr);
+      else { const e = new Error(`ffmpeg exited ${code}`); e.stderr = stderr; reject(e); }
+    });
+    proc.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+async function concatSegments(segments, outputFile, listDir) {
   const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
   if (!segments.length) throw new Error('No segments to concatenate');
 
-  // Remux to a normal faststart mp4 (segments may be fragmented)
   if (segments.length === 1) {
-    execSync(
-      `"${ffmpegPath}" -hide_banner -y -i "${segments[0]}" -c copy -movflags +faststart "${outputFile}"`,
-      {
-        encoding: 'utf8',
-        timeout: 180000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
-      }
-    );
+    await runFfmpegAsync(ffmpegPath, [
+      '-hide_banner', '-y', '-i', segments[0], '-c', 'copy', '-movflags', '+faststart', outputFile
+    ], 180000);
     return;
   }
 
@@ -2102,39 +2179,39 @@ function concatSegments(segments, outputFile, listDir) {
   const body = segments.map((s) => `file '${escapeConcatPath(s)}'`).join('\n');
   fs.writeFileSync(listFile, body, 'utf8');
 
-  const run = (args) => {
-    execSync(`"${ffmpegPath}" ${args}`, {
-      encoding: 'utf8',
-      timeout: 300000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
-    });
-  };
-
   try {
-    run(`-hide_banner -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outputFile}"`);
+    await runFfmpegAsync(ffmpegPath, [
+      '-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', listFile,
+      '-c', 'copy', '-movflags', '+faststart', outputFile
+    ]);
   } catch (e) {
     console.warn('concat copy failed, remuxing:', e.message || e);
-    run(`-hide_banner -y -f concat -safe 0 -i "${listFile}" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 160k -movflags +faststart "${outputFile}"`);
+    await runFfmpegAsync(ffmpegPath, [
+      '-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', listFile,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+      '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', outputFile
+    ]);
   }
 }
 
-function muxLoopbackAudio(videoFile, audioFile, outputFile) {
+async function muxLoopbackAudio(videoFile, audioFile, outputFile) {
   const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
   if (!ffmpegPath) throw new Error('FFmpeg missing');
   const dest = videoFile === outputFile ? `${outputFile}.with-audio.mp4` : outputFile;
-  const run = (args) => {
-    execSync(`"${ffmpegPath}" ${args}`, {
-      encoding: 'utf8',
-      timeout: 300000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
-    });
-  };
   try {
-    run(`-hide_banner -y -i "${videoFile}" -i "${audioFile}" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ac 2 -ar 48000 -shortest -movflags +faststart "${dest}"`);
+    await runFfmpegAsync(ffmpegPath, [
+      '-hide_banner', '-y', '-i', videoFile, '-i', audioFile,
+      '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac',
+      '-b:a', '192k', '-ac', '2', '-ar', '48000', '-shortest',
+      '-movflags', '+faststart', dest
+    ]);
   } catch (e) {
-    run(`-hide_banner -y -i "${videoFile}" -i "${audioFile}" -map 0:v:0 -map 1:a:0 -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 192k -ac 2 -ar 48000 -shortest -movflags +faststart "${dest}"`);
+    await runFfmpegAsync(ffmpegPath, [
+      '-hide_banner', '-y', '-i', videoFile, '-i', audioFile,
+      '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+      '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000', '-shortest',
+      '-movflags', '+faststart', dest
+    ]);
   }
   if (dest !== outputFile) {
     try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) { /* ignore */ }
@@ -2246,18 +2323,24 @@ async function stopLoopbackCapture() {
   } catch (e) { /* ignore */ }
   loopbackStream = null;
   loopbackReady = false;
+  loopbackBackpressure = false;
   loopbackFile = file && fs.existsSync(file) && fs.statSync(file).size > 2048 ? file : null;
   return loopbackFile;
 }
 
+let loopbackBackpressure = false;
 ipcMain.on('loopback-audio-chunk', (_e, buf) => {
-  if (!loopbackStream || !buf) return;
+  if (!loopbackStream || !buf || loopbackBackpressure) return;
   try {
     const data = Buffer.from(buf);
     loopbackBytes += data.length;
-    loopbackStream.write(data);
+    const ok = loopbackStream.write(data);
+    if (!ok) {
+      loopbackBackpressure = true;
+      loopbackStream.once('drain', () => { loopbackBackpressure = false; });
+    }
   } catch (e) {
-    console.error('loopback write failed:', e);
+    diag.warn('AUDIO', 'Loopback write failed', { err: e.message || String(e) });
   }
 });
 
@@ -2295,6 +2378,10 @@ function sanitizeKnownGames(list) {
       id,
       title: String(g.title || id).slice(0, 120),
       exe: g.exe ? String(g.exe).slice(0, 80) : '',
+      method: g.method === 'wgc' || g.method === 'ddagrab' ? g.method : 'wgc',
+      failCount: Math.min(99, Math.max(0, Number(g.failCount) || 1)),
+      lastTriedAt: Number(g.lastTriedAt) || Number(g.addedAt) || Date.now(),
+      lastOkAt: Number(g.lastOkAt) || 0,
       addedAt: Number(g.addedAt) || Date.now()
     });
     if (out.length >= 40) break;
@@ -2311,10 +2398,30 @@ function diskSpaceWarnBytes() {
   return Math.max(hard * 3, hard + 1024 * 1024 * 1024);
 }
 
-function appendDiagnosticsLine(line) {
-  const text = `${new Date().toISOString()}  ${line}`;
+function appendDiagnosticsRaw(line) {
   console.log(line);
-  try { fs.appendFileSync(diagnosticsLogPath(), `${text}\n`, 'utf8'); } catch (e) { /* ignore */ }
+  try { fs.appendFileSync(diagnosticsLogPath(), `${line}\n`, 'utf8'); } catch (e) { /* keep running if log disk fails */ }
+}
+
+function appendDiagnosticsLine(line) {
+  appendDiagnosticsRaw(`${new Date().toISOString()}  ${line}`);
+}
+
+const diag = createDiag({ appendLine: appendDiagnosticsRaw });
+const rec = createRecState((from, to, meta) => {
+  diag.info('STATE', `${from} → ${to}`, meta);
+});
+
+function recToIdle(reason) {
+  if (rec.phase !== 'idle' && rec.phase !== 'error') rec.transition('error', { reason });
+  if (rec.phase === 'error') rec.transition('idle', { reason });
+  else if (rec.phase === 'completed' || rec.phase === 'recovered') rec.transition('idle', { reason });
+}
+
+function notifyFriendly(raw, category) {
+  const f = friendlyError(raw, category);
+  notifyUser(f.hint ? `${f.message} ${f.hint}` : f.message);
+  return f;
 }
 
 function notifyUser(message) {
@@ -2377,6 +2484,43 @@ function remuxCopyToMp4(inputFile, outputFile) {
   }
   if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size < 8192) {
     throw new Error('Remux produced an empty file');
+  }
+}
+
+function verifyFinalFile(filePath, { wantAudio = false } = {}) {
+  let exists = false;
+  let size = 0;
+  try {
+    exists = fs.existsSync(filePath);
+    if (exists) size = fs.statSync(filePath).size;
+  } catch (e) {
+    return { ok: false, reason: 'stat-failed' };
+  }
+  const basic = verifyOutputBasics({ exists, size });
+  if (!basic.ok) return basic;
+  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  if (!ffmpegPath) return { ok: true, size, duration: 0, skippedProbe: true };
+  let text = '';
+  try {
+    runFfmpegArgv(ffmpegPath, ['-hide_banner', '-i', filePath], 25000);
+  } catch (e) {
+    text = `${e.stderr || ''}${e.stdout || ''}${e.message || ''}`;
+  }
+  return { ...verifyFromFfmpegProbe(text, { wantAudio }), size };
+}
+
+function recoverOneContainer(inputFile, outputFile) {
+  remuxCopyToMp4(inputFile, outputFile);
+  const v = verifyFinalFile(outputFile);
+  if (!v.ok) {
+    diag.error('RECOVERY', 'Remux failed verification — keeping source', { file: inputFile, reason: v.reason });
+    try {
+      if (fs.existsSync(outputFile) && fs.statSync(outputFile).size < 8192) fs.unlinkSync(outputFile);
+    } catch (e) { /* keep both */ }
+    throw new Error(v.reason || 'verify failed');
+  }
+  try { fs.unlinkSync(inputFile); } catch (e) {
+    diag.warn('RECOVERY', 'Could not remove source after verified remux', { file: inputFile });
   }
 }
 
@@ -2488,25 +2632,47 @@ function isKnownUnstableGame(ident) {
   const id = String(ident.id || '').toLowerCase();
   const title = String(ident.title || '').toLowerCase();
   return games.some((g) => {
-    if (exe && g.exe && String(g.exe).toLowerCase() === exe) return true;
-    if (id && g.id && g.id === id) return true;
-    if (title && g.title && title.includes(String(g.title).toLowerCase()) && String(g.title).length > 3) return true;
-    return false;
+    let match = false;
+    if (exe && g.exe && String(g.exe).toLowerCase() === exe) match = true;
+    if (id && g.id && g.id === id) match = true;
+    if (title && g.title && title.includes(String(g.title).toLowerCase()) && String(g.title).length > 3) match = true;
+    if (!match) return false;
+    if (shouldRetestUnstableGame(g)) {
+      diag.info('GAME_PROFILE', 'Retesting ddagrab after cooldown', { game: g.exe || g.id });
+      return false;
+    }
+    return true;
   });
 }
 
 function rememberUnstableGame(ident, reason) {
   const info = ident || foregroundGameIdentity();
   if (!info || !info.id) return;
-  if (isKnownUnstableGame(info)) return;
+  const games = settings.knownUnstableGames || [];
+  const existing = games.find((g) => (info.exe && g.exe && String(g.exe).toLowerCase() === String(info.exe).toLowerCase()) || g.id === info.id);
+  if (existing) {
+    existing.failCount = Math.min(99, (Number(existing.failCount) || 1) + 1);
+    existing.lastTriedAt = Date.now();
+    existing.method = 'wgc';
+    settings.knownUnstableGames = sanitizeKnownGames(games);
+    saveSettings(settings);
+    diag.warn('GAME_PROFILE', 'Updated capture fallback', { game: info.exe || info.title, reason });
+    return;
+  }
   settings.knownUnstableGames = sanitizeKnownGames([
-    ...(settings.knownUnstableGames || []),
-    { id: info.id, title: info.title, exe: info.exe || '', addedAt: Date.now() }
+    ...games,
+    {
+      id: info.id,
+      title: info.title,
+      exe: info.exe || '',
+      method: 'wgc',
+      failCount: 1,
+      lastTriedAt: Date.now(),
+      addedAt: Date.now()
+    }
   ]);
   saveSettings(settings);
-  appendDiagnosticsLine(
-    `Capture fallback remembered: skip ddagrab for "${info.exe || info.title}" (${reason || 'ddagrab failed'})`
-  );
+  diag.warn('GAME_PROFILE', `Skip ddagrab for ${info.exe || info.title}`, { reason });
 }
 
 function forgetUnstableGame(id) {
@@ -2515,11 +2681,6 @@ function forgetUnstableGame(id) {
   saveSettings(settings);
   appendDiagnosticsLine(`Capture fallback cleared: ${key}`);
   return { ok: true, knownUnstableGames: settings.knownUnstableGames };
-}
-
-function recoverOneContainer(inputFile, outputFile) {
-  remuxCopyToMp4(inputFile, outputFile);
-  try { fs.unlinkSync(inputFile); } catch (e) { /* keep source if delete fails */ }
 }
 
 function recoverAnnexbPair(videoFile, audioFile, metaFile, outputFile) {
@@ -2549,7 +2710,7 @@ function recoverAnnexbPair(videoFile, audioFile, metaFile, outputFile) {
   }
 }
 
-function recoverCrashedRecordings() {
+async function recoverCrashedRecordings() {
   const recovered = [];
   const folder = settings.outputFolder;
   if (!folder || !fs.existsSync(folder) || !ffmpegCaps.available) return recovered;
@@ -2611,23 +2772,28 @@ function recoverCrashedRecordings() {
           try { return fs.statSync(p).size > 1024; } catch (e) { return false; }
         })
         .sort();
+      let recoveredOk = false;
       if (segs.length) {
         const out = recoveredOutputName('recording');
         try {
-          concatSegments(segs, out, dir);
+          await concatSegments(segs, out, dir);
+          const v = verifyFinalFile(out);
+          if (!v.ok) throw new Error(v.reason || 'verify failed');
           recovered.push(out);
+          recoveredOk = true;
         } catch (e) {
-          console.warn('Session concat failed, remuxing largest segment:', e.message || e);
+          diag.warn('RECOVERY', 'Session concat failed, trying largest segment', { err: e.message || String(e) });
           try {
             const biggest = segs.slice().sort((a, b) => fs.statSync(b).size - fs.statSync(a).size)[0];
             recoverOneContainer(biggest, out);
             recovered.push(out);
+            recoveredOk = true;
           } catch (e2) {
-            console.warn('Session remux failed:', e2.message || e2);
+            diag.error('RECOVERY', 'Session remux failed — keeping folder', { err: e2.message || String(e2) });
           }
         }
       }
-      rmSessionFolder(dir);
+      if (recoveredOk || !segs.length) rmSessionFolder(dir);
     }
   } catch (e) {
     console.warn('Session folder recovery failed:', e.message || e);
@@ -2651,13 +2817,18 @@ function recoverCrashedRecordings() {
       if (parts.length >= 2 || (parts.length === 1 && fs.statSync(parts[0]).size > 64 * 1024)) {
         const out = recoveredOutputName('replay');
         try {
-          concatSegments(parts.sort(), out, bufDir);
+          const ordered = parts.slice().sort((a, b) => {
+            try { return fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs; } catch (e) { return String(a).localeCompare(String(b)); }
+          });
+          await concatSegments(ordered, out, bufDir);
+          const v = verifyFinalFile(out);
+          if (!v.ok) throw new Error(v.reason || 'verify failed');
           recovered.push(out);
-          for (const p of parts) {
-            try { fs.unlinkSync(p); } catch (e) { /* ignore */ }
+          for (const p of ordered) {
+            try { fs.unlinkSync(p); } catch (e) { /* keep leftover if delete fails */ }
           }
         } catch (e) {
-          console.warn('Replay concat failed, remuxing largest segment:', e.message || e);
+          diag.warn('RECOVERY', 'Replay concat failed, remuxing largest segment', { err: e.message || String(e) });
           try {
             const biggest = parts.slice().sort((a, b) => fs.statSync(b).size - fs.statSync(a).size)[0];
             recoverOneContainer(biggest, out);
@@ -2773,7 +2944,7 @@ function launchSegment() {
   stderrBuf = '';
 
   ffmpegProcess.on('error', (err) => {
-    console.error('ffmpeg spawn error:', err);
+    diag.error('ENCODER', 'ffmpeg spawn error', { err: err.message || String(err) });
   });
 
   ffmpegProcess.stderr.on('data', (data) => {
@@ -2801,8 +2972,8 @@ function launchSegment() {
         if (next) settings.audioDevice = next;
         session.micDevice = session.micDevice || pickMicrophoneDevice(devices);
         notifyUser(next
-          ? `WASAPI loopback failed — switched to ${next}`
-          : 'WASAPI loopback failed — game audio may be silent');
+          ? `Game audio switched to ${next}`
+          : 'Game audio may be silent — press Test Audio in Settings');
       } catch (e) { /* ignore */ }
       restartCurrentSegment();
       return;
@@ -2953,7 +3124,7 @@ function launchSegment() {
         return;
       }
       console.error('ffmpeg exited unexpectedly while recording, code=', code);
-      console.error(stderrBuf.slice(-1500));
+      diag.critical('ENCODER', 'FFmpeg quit while recording — keeping session files', { code, tail: String(failMsg).slice(-240) });
       isRecording = false;
       isPaused = false;
       recordingStartedAt = null;
@@ -2961,41 +3132,52 @@ function launchSegment() {
       totalPausedMs = 0;
       resetCaptureStats();
       stopStatsPolling();
-      const failedFolder = session ? session.folder : null;
+      rec.force('error', { via: 'ffmpeg-exit', code });
       session = null;
       ffmpegProcess = null;
-      if (failedFolder) rmSessionFolder(failedFolder);
+      recToIdle('ffmpeg-exit');
       restoreMainWindow();
       broadcastState();
+      const f = friendlyError(failMsg || `ffmpeg exit ${code}`, 'ENCODER');
       dialog.showMessageBox(mainWindow || undefined, {
         type: 'error',
-        title: 'Recording stopped',
-        message: 'FFmpeg quit while recording — nothing usable was saved.',
-        detail: (stderrBuf || '').split(/\r?\n/).slice(-8).join('\n') || `exit code ${code}`,
+        title: f.title,
+        message: f.message,
+        detail: f.hint || f.detail,
         buttons: ['OK']
       });
     }
   });
 }
 
-function restartCurrentSegment() {
+function restartCurrentSegment({ keepPartial = false } = {}) {
   if (!session || !ffmpegProcess) {
     launchSegment();
     return;
   }
   session.intent = 'restarting';
   const proc = ffmpegProcess;
-  try {
-    proc.removeAllListeners('close');
-    proc.kill();
-  } catch (e) { /* ignore */ }
   ffmpegProcess = null;
-  // Overwrite the failed/partial segment file
+  try { proc.removeAllListeners('close'); } catch (e) { /* ignore */ }
+  const onDone = () => {
+    try {
+      const p = currentSegmentPath();
+      if (keepPartial && p && fs.existsSync(p) && fs.statSync(p).size > 1024) {
+        if (!session.segments.includes(p)) session.segments.push(p);
+        nextSegmentPath();
+      } else if (p && fs.existsSync(p)) {
+        fs.unlinkSync(p);
+      }
+    } catch (e) { /* ignore */ }
+    launchSegment();
+    audioSwitchInFlight = false;
+  };
   try {
-    const p = currentSegmentPath();
-    if (fs.existsSync(p)) fs.unlinkSync(p);
-  } catch (e) { /* ignore */ }
-  launchSegment();
+    proc.on('close', onDone);
+    proc.kill();
+  } catch (e) {
+    onDone();
+  }
 }
 
 // ---------- Instant Replay (rolling segment buffer) ----------
@@ -3011,10 +3193,19 @@ function getReplayWrapCount() {
   return Math.ceil((minutes * 60) / REPLAY_SEGMENT_SECONDS);
 }
 
+function replayBufferOriginMs() {
+  if (medal.active) {
+    return Date.now() - (medalVideoSeconds() * 1000);
+  }
+  const files = listReplayBufferFilesDetailed();
+  const spanMs = Math.max(0, files.length * REPLAY_SEGMENT_SECONDS * 1000);
+  if (spanMs > 0) return Date.now() - spanMs;
+  return replayBufferStartedAt || Date.now();
+}
+
 function pruneReplayBookmarks() {
-  const minutes = Math.min(5, Number(settings.instantReplayMinutes) || 5);
-  const oldest = Date.now() - minutes * 60 * 1000 - 5000;
-  replayBookmarks = (replayBookmarks || []).filter((b) => Number(b.at) >= oldest);
+  const origin = replayBufferOriginMs();
+  replayBookmarks = (replayBookmarks || []).filter((b) => Number(b.at) >= origin - 2000);
   return replayBookmarks;
 }
 
@@ -3025,10 +3216,14 @@ function markReplayBookmark() {
     return { ok: false, error: 'Instant Replay is not active' };
   }
   pruneReplayBookmarks();
-  replayBookmarks.push({ at: Date.now() });
+  const origin = replayBufferOriginMs();
+  replayBookmarks.push({
+    at: Date.now(),
+    relMs: Math.max(0, Date.now() - origin)
+  });
   playCue('bookmark');
   broadcastState();
-  return { ok: true, count: replayBookmarks.length };
+  return { ok: true, count: replayBookmarks.length, relMs: replayBookmarks[replayBookmarks.length - 1].relMs };
 }
 
 function bookmarksInRange(saveMinutes, endedAt) {
@@ -3040,6 +3235,7 @@ function bookmarksInRange(saveMinutes, endedAt) {
     .map((b, i) => ({
       index: i + 1,
       at: b.at,
+      bufferRelMs: b.relMs != null ? Number(b.relMs) : Math.max(0, b.at - replayBufferOriginMs()),
       seconds: Math.max(0, (b.at - start) / 1000)
     }));
 }
@@ -3050,7 +3246,10 @@ function writeReplayBookmarkSidecar(outputFile, marks, saveMinutes) {
     file: path.basename(outputFile),
     saveMinutes,
     createdAt: new Date().toISOString(),
-    bookmarks: marks
+    bookmarks: marks.map((m) => ({
+      index: m.index,
+      seconds: Number(Number(m.seconds).toFixed(3))
+    }))
   };
   const jsonPath = outputFile.replace(/\.[^.]+$/i, '.json');
   fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2), 'utf8');
@@ -3091,13 +3290,12 @@ function embedReplayChapters(outputFile, marks) {
 
 function attachReplayBookmarks(outputFile, saveMinutes, endedAt) {
   const marks = bookmarksInRange(saveMinutes, endedAt);
-  if (!marks.length) return { sidecar: null, chapters: false, bookmarks: [] };
+  if (!marks.length) return { sidecar: null, bookmarks: [] };
   let sidecar = null;
   try { sidecar = writeReplayBookmarkSidecar(outputFile, marks, saveMinutes); } catch (e) {
     console.warn('Bookmark sidecar failed:', e.message || e);
   }
-  const chapters = embedReplayChapters(outputFile, marks);
-  return { sidecar, chapters, bookmarks: marks };
+  return { sidecar, bookmarks: marks };
 }
 
 async function waitReplayFilesStable(tries = 6) {
@@ -3193,21 +3391,60 @@ function listReplayBufferFiles() {
   return listReplayBufferFilesDetailed().map((f) => f.full);
 }
 
+function replaySaveNeedCount(saveMinutes) {
+  const seconds = Math.max(30, Math.round(Number(saveMinutes) * 60)) || 300;
+  return Math.max(1, Math.ceil(seconds / REPLAY_SEGMENT_SECONDS));
+}
+
+function copyReplayFileToStaging(src, staging, index) {
+  const dest = path.join(staging, `part_${String(index).padStart(3, '0')}${path.extname(src)}`);
+  fs.copyFileSync(src, dest);
+  return dest;
+}
+
+/** Closed rolling files only — never the segment ffmpeg is still writing. */
+function closedReplaySegments(files) {
+  if (!files.length) return [];
+  if (replayProcess && files.length >= 1) return files.slice(0, -1);
+  return files;
+}
+
+function replayFileIsUsable(file) {
+  return Boolean(file && file.size >= 8 * 1024);
+}
+
+/**
+ * Copy fully-written buffer files before ffmpeg can wrap onto them.
+ * Does not touch concatSegments / segment_format / live mux.
+ */
+function stageClosedReplaySegments(saveMinutes, staging) {
+  const need = replaySaveNeedCount(saveMinutes);
+  const live = listReplayBufferFilesDetailed();
+  const closed = closedReplaySegments(live).filter(replayFileIsUsable);
+  const newest = live.length ? live[live.length - 1] : null;
+  const wrapping = Boolean(replayProcess && newest && !replayFileIsUsable(newest));
+  const windowFiles = closed.slice(-need);
+  const staged = windowFiles.map((f, i) => copyReplayFileToStaging(f.full, staging, i));
+  return {
+    staged,
+    need,
+    writing: newest,
+    wrapping
+  };
+}
+
 /** Take only the last N minutes (by mtime order / segment count). Skip wrap stubs. */
 function selectReplaySegmentsForSave(saveMinutes) {
   let all = listReplayBufferFilesDetailed();
   if (!all.length) return [];
-  if (all.length >= 2) {
+  if (replayProcess && all.length >= 1) {
+    all = all.slice(0, -1);
+  } else if (all.length >= 2) {
     const newest = all[all.length - 1];
     const prev = all[all.length - 2];
     if (newest.size < Math.max(8 * 1024, prev.size * 0.15)) {
       all = all.slice(0, -1);
     }
-  }
-  if (all.length >= 3) {
-    const sizes = all.map((f) => f.size).slice().sort((a, b) => a - b);
-    const med = sizes[Math.floor(sizes.length / 2)] || 0;
-    if (med > 0 && all[0].size < med * 0.2) all = all.slice(1);
   }
   const seconds = Math.max(30, Math.round(Number(saveMinutes) * 60)) || 300;
   const need = Math.max(1, Math.ceil(seconds / REPLAY_SEGMENT_SECONDS));
@@ -3240,7 +3477,13 @@ function startReplayProcess({ clearBuffer = false } = {}) {
   }
   const dir = getReplayBufferDir();
   fs.mkdirSync(dir, { recursive: true });
-  if (clearBuffer) clearReplayBufferFiles();
+  if (clearBuffer) {
+    clearReplayBufferFiles();
+    replayBookmarks = [];
+    replayBufferStartedAt = Date.now();
+  } else if (!replayBufferStartedAt) {
+    replayBufferStartedAt = Date.now();
+  }
 
   replayUseDdagrab = ffmpegCaps.hasDdagrab;
   replayUseAmf = pickActiveEncoder({ hardware: true }).hardware;
@@ -3450,6 +3693,18 @@ async function toggleInstantReplay(enable) {
 }
 
 async function saveInstantReplay(saveMinutesOverride) {
+  return replaySaveQueue.enqueue(() => saveInstantReplayNow(saveMinutesOverride));
+}
+
+async function saveInstantReplayNow(saveMinutesOverride) {
+  if (lastDiskFreeBytes != null && lastDiskFreeBytes <= diskSpaceLimitBytes()) {
+    lastReplaySave = { ok: false, at: Date.now(), error: 'disk', file: null };
+    playCue('fail');
+    return { ok: false, error: userFacing('Disk space is too low', 'STORAGE') };
+  }
+  if (replayPausedForRecording && isRecording && !medal.active) {
+    diag.warn('REPLAY', 'Save while recording uses leftover buffer, not live capture');
+  }
   if (!settings.instantReplayEnabled && !medal.active && !instantReplayActive && !replayProcess) {
     playCue('fail');
     return { ok: false, error: 'Instant Replay is not active — turn it ON and wait for the buffer to fill' };
@@ -3465,30 +3720,7 @@ async function saveInstantReplay(saveMinutesOverride) {
     return saveMedalReplay(saveMinutes);
   }
 
-  // Finalize the current rolling segment so the last file is complete, then stitch.
-  if (replayProcess) {
-    const proc = replayProcess;
-    if (typeof proc._setReplayIntent === 'function') proc._setReplayIntent('save');
-    sendQuit(proc);
-    await waitForProcessClose(proc, 25000);
-    replayProcess = null;
-    instantReplayActive = false;
-    await new Promise((r) => setTimeout(r, 400));
-    await waitReplayFilesStable();
-  }
-
-  const saveEndedAt = Date.now();
-
-  let segments = selectReplaySegmentsForSave(saveMinutes);
-  if (!segments.length) {
-    if (settings.instantReplayEnabled) startReplayProcess({ clearBuffer: false });
-    lastReplaySave = { ok: false, at: Date.now(), error: 'empty', file: null };
-    playCue('fail');
-    return {
-      ok: false,
-      error: 'Replay buffer is empty — leave Instant Replay ON for at least ~15–30 seconds, then try again'
-    };
-  }
+  const saveRequestedAt = Date.now();
 
   if (!fs.existsSync(settings.outputFolder)) {
     fs.mkdirSync(settings.outputFolder, { recursive: true });
@@ -3498,77 +3730,73 @@ async function saveInstantReplay(saveMinutesOverride) {
   const label = saveMinutes < 1 ? '30s' : `${saveMinutes}min`;
   const outputFile = path.join(settings.outputFolder, `replay-${label}-${timestamp}.mp4`);
   const dir = getReplayBufferDir();
-  const listFile = path.join(dir, 'replay-concat.txt');
-
-  // Copy chosen segments to a staging folder so a restarted buffer can't overwrite mid-save
   const staging = path.join(dir, `.save-staging-${Date.now()}`);
   fs.mkdirSync(staging, { recursive: true });
-  const staged = [];
-  try {
-    segments.forEach((src, i) => {
-      const dest = path.join(staging, `part_${String(i).padStart(3, '0')}${path.extname(src)}`);
-      fs.copyFileSync(src, dest);
-      staged.push(dest);
-    });
 
-    const body = staged.map((s) => `file '${escapeConcatPath(s)}'`).join('\n') + '\n';
-    // No UTF-8 BOM — ffmpeg concat demuxer rejects BOM as an unknown keyword
-    fs.writeFileSync(listFile, body, { encoding: 'ascii' });
-
-    const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
-    if (staged.length === 1 && staged[0].toLowerCase().endsWith('.mp4')) {
-      fs.copyFileSync(staged[0], outputFile);
-    } else {
-      try {
-        execSync(
-          `"${ffmpegPath}" -hide_banner -y -f concat -safe 0 -i "${listFile}" -c copy -movflags +faststart "${outputFile}"`,
-          {
-            encoding: 'utf8',
-            timeout: 180000,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            windowsHide: true
-          }
-        );
-      } catch (copyErr) {
-        // Fallback: remux if bitstream copy fails across segments
-        console.warn('concat -c copy failed, remuxing:', copyErr.stderr || copyErr.message);
-        execSync(
-          `"${ffmpegPath}" -hide_banner -y -f concat -safe 0 -i "${listFile}" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k -movflags +faststart "${outputFile}"`,
-          {
-            encoding: 'utf8',
-            timeout: 300000,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            windowsHide: true
-          }
-        );
-      }
-    }
-
-    if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size < 1024) {
-      throw new Error('Save produced an empty file');
-    }
-  } catch (e) {
+  const failSave = (detail) => {
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch (e2) { /* ignore */ }
     if (settings.instantReplayEnabled) startReplayProcess({ clearBuffer: false });
-    const detail = (e.stderr && String(e.stderr).slice(-300)) || e.message || String(e);
     lastReplaySave = { ok: false, at: Date.now(), error: detail, file: null };
     playCue('fail');
-    return { ok: false, error: `Save failed: ${detail}` };
+    return { ok: false, error: detail };
+  };
+
+  let staged = [];
+  try {
+    // Copy closed segments first so wrap cannot clobber the save window.
+    const pre = stageClosedReplaySegments(saveMinutes, staging);
+    staged = pre.staged;
+    const writingPath = pre.writing && pre.writing.full;
+
+    if (replayProcess) {
+      const proc = replayProcess;
+      if (typeof proc._setReplayIntent === 'function') proc._setReplayIntent('save');
+      sendQuit(proc);
+      await waitForProcessClose(proc, 25000);
+      replayProcess = null;
+      instantReplayActive = false;
+      await new Promise((r) => setTimeout(r, 250));
+      await waitReplayFilesStable(4);
+    }
+
+    if (writingPath && fs.existsSync(writingPath)) {
+      let size = 0;
+      try { size = fs.statSync(writingPath).size; } catch (e) { size = 0; }
+      if (size >= 8 * 1024) {
+        staged.push(copyReplayFileToStaging(writingPath, staging, staged.length));
+      }
+      // Truncated wrap stub: skip it (shift to last fully-written boundary)
+    }
+
+    if (staged.length > pre.need) staged = staged.slice(-pre.need);
+
+    if (!staged.length) {
+      return failSave('Replay buffer is empty — leave Instant Replay ON for at least ~15–30 seconds, then try again');
+    }
+
+    await concatSegments(staged, outputFile, staging);
+
+    const verified = verifyFinalFile(outputFile);
+    if (!verified.ok) {
+      throw new Error('Save produced an empty file');
+    }
+
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+
+    const marks = attachReplayBookmarks(outputFile, saveMinutes, saveRequestedAt);
+
+    if (settings.instantReplayEnabled && !isRecording) {
+      startReplayProcess({ clearBuffer: false });
+    }
+
+    lastReplaySave = { ok: true, at: Date.now(), error: null, file: outputFile };
+    playCue('saved');
+    broadcastState();
+    return { ok: true, file: outputFile, segments: staged.length, saveMinutes, bookmarks: marks.bookmarks };
+  } catch (e) {
+    const detail = (e.stderr && String(e.stderr).slice(-300)) || e.message || String(e);
+    return failSave(`Save failed: ${detail}`);
   }
-
-  try { fs.rmSync(staging, { recursive: true, force: true }); } catch (e) { /* ignore */ }
-
-  const marks = attachReplayBookmarks(outputFile, saveMinutes, saveEndedAt);
-
-  // Keep buffering — do not delete segment files
-  if (settings.instantReplayEnabled && !isRecording) {
-    startReplayProcess({ clearBuffer: false });
-  }
-
-  lastReplaySave = { ok: true, at: Date.now(), error: null, file: outputFile };
-  playCue('saved');
-  broadcastState();
-  return { ok: true, file: outputFile, segments: segments.length, saveMinutes, bookmarks: marks.bookmarks };
 }
 
 function setPttHeld(held) {
@@ -3909,6 +4137,7 @@ async function startMedalEngineLocked(retarget) {
   sendCaptureAudioMode();
   broadcastState();
   updateTrayMenu();
+  if (settings.recordAudio && !medal.hasLoopback) maybeExplainAudioFallback();
   return { ok: true, source: source.name, audio: medal.hasAudio, loopback: medal.hasLoopback, mic: medal.hasMic };
 }
 
@@ -3943,6 +4172,11 @@ function beginMedalSession() {
   medal.recording = true;
   isRecording = true;
   isPaused = false;
+  if (rec.phase === 'starting') rec.transition('recording', { via: 'medal' });
+  else if (rec.canStart()) {
+    rec.transition('starting', { via: 'medal' });
+    rec.transition('recording', { via: 'medal' });
+  }
   recordingStartedAt = Date.now();
   pauseStartedAt = null;
   totalPausedMs = 0;
@@ -4002,6 +4236,12 @@ async function stopMedalRecording() {
   await resumeReplayAfterRecording();
   if (settings.instantReplayEnabled && medal.active) instantReplayActive = true;
   if (!settings.instantReplayEnabled) await stopMedalEngine({ force: true });
+  if (error) recToIdle('medal-stop-failed');
+  else {
+    rec.transition('finalizing', { via: 'medal' });
+    rec.transition('completed', { via: 'medal' });
+    rec.transition('idle', { via: 'medal' });
+  }
   updateTrayMenu();
   broadcastState();
   restoreMainWindow();
@@ -4284,9 +4524,9 @@ async function switchDesktopRecordingToGame() {
     if (prefixSegments.length) {
       try {
         const prefix = path.join(active.folder, 'desktop-prefix.mp4');
-        concatSegments(prefixSegments, prefix, active.folder);
+        await concatSegments(prefixSegments, prefix, active.folder);
         if (audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048) {
-          muxLoopbackAudio(prefix, audioFile, prefix);
+          await muxLoopbackAudio(prefix, audioFile, prefix);
         }
         prefixSegments = [prefix];
       } catch (e) {
@@ -4309,7 +4549,7 @@ async function switchDesktopRecordingToGame() {
 
     try {
       if (recordingHandoff && recordingHandoff.segments.length) {
-        concatSegments(recordingHandoff.segments, recordingHandoff.finalFile, recordingHandoff.folder);
+        await concatSegments(recordingHandoff.segments, recordingHandoff.finalFile, recordingHandoff.folder);
         currentOutputFile = recordingHandoff.finalFile;
       }
       if (recordingHandoff && recordingHandoff.folder) rmSessionFolder(recordingHandoff.folder);
@@ -4449,7 +4689,9 @@ async function startGameCapture(opts = {}) {
       clearTimeout(t);
       cleanupReady();
       gameCaptureMime = (info && info.mimeType) || 'video/webm';
-      resolve({ ok: true, source: source.name });
+      medal.hasLoopback = Boolean(info && info.loopback);
+      medal.hasMic = Boolean(info && info.mic);
+      resolve({ ok: true, source: source.name, loopback: medal.hasLoopback });
     };
     const onFailed = (_e, msg) => {
       clearTimeout(t);
@@ -4479,6 +4721,11 @@ async function startGameCapture(opts = {}) {
 
   isRecording = true;
   isPaused = false; // pause not supported on this path yet
+  if (rec.phase === 'starting') rec.transition('recording', { via: 'wgc' });
+  else if (rec.canStart()) {
+    rec.transition('starting', { via: 'wgc' });
+    rec.transition('recording', { via: 'wgc' });
+  }
   if (!continueSession) {
     recordingStartedAt = Date.now();
     pauseStartedAt = null;
@@ -4495,6 +4742,7 @@ async function startGameCapture(opts = {}) {
   updateTrayMenu();
   broadcastState();
   appendDiagnosticsLine(`Audio: Chromium/WGC capture (${describeAudioRoute()})`);
+  if (settings.recordAudio && !medal.hasLoopback) maybeExplainAudioFallback();
   return { ok: true, file: currentOutputFile, mode: 'game-capture', source: result.source };
 }
 
@@ -4570,7 +4818,7 @@ async function stopGameCapture() {
       if (currentOutputFile && fs.existsSync(currentOutputFile) && fs.statSync(currentOutputFile).size >= 8192) {
         parts.push(currentOutputFile);
       }
-      concatSegments(parts, handoff.finalFile, handoff.folder);
+      await concatSegments(parts, handoff.finalFile, handoff.folder);
       const merged = handoff.finalFile;
       if (currentOutputFile && currentOutputFile !== merged && fs.existsSync(currentOutputFile)) {
         try { fs.unlinkSync(currentOutputFile); } catch (e) { /* keep extra file */ }
@@ -4583,7 +4831,7 @@ async function stopGameCapture() {
     try { rmSessionFolder(handoff.folder); } catch (e) { /* ignore */ }
   } else if (error && handoff && handoff.segments && handoff.segments.length) {
     try {
-      concatSegments(handoff.segments, handoff.finalFile, handoff.folder);
+      await concatSegments(handoff.segments, handoff.finalFile, handoff.folder);
       currentOutputFile = handoff.finalFile;
       finalSize = fs.existsSync(handoff.finalFile) ? fs.statSync(handoff.finalFile).size : 0;
       error = null;
@@ -4600,6 +4848,12 @@ async function stopGameCapture() {
   recordingStartedAt = null;
   stopStatsPolling();
   await resumeReplayAfterRecording();
+  if (error) recToIdle('wgc-stop-failed');
+  else {
+    rec.transition('finalizing', { via: 'wgc' });
+    rec.transition('completed', { via: 'wgc' });
+    rec.transition('idle', { via: 'wgc' });
+  }
   updateTrayMenu();
   broadcastState();
   restoreMainWindow();
@@ -4677,20 +4931,40 @@ ipcMain.on('medal-capture-stats', (_e, info) => {
 });
 
 // Wire chunk IPC once
+let gameCaptureBackpressure = false;
 ipcMain.on('game-capture-chunk', (_e, buf) => {
-  if (!usingGameCapture || !gameCaptureStream) return;
+  if (!usingGameCapture || !gameCaptureStream || gameCaptureBackpressure) return;
   try {
     const data = Buffer.from(buf);
     gameCaptureBytes += data.length;
-    gameCaptureStream.write(data);
+    const ok = gameCaptureStream.write(data);
+    if (!ok) {
+      gameCaptureBackpressure = true;
+      gameCaptureStream.once('drain', () => { gameCaptureBackpressure = false; });
+    }
   } catch (e) {
-    console.error('game capture write failed:', e);
+    diag.warn('CAPTURE', 'Game capture write failed', { err: e.message || String(e) });
   }
 });
 
 // ---------- Recording control ----------
 async function startRecording() {
-  if (isRecording) return { ok: false, error: 'Already recording' };
+  if (isRecording || rec.isActive()) {
+    return { ok: false, error: userFacing('Already recording', 'CAPTURE') };
+  }
+  if (!rec.canStart() || !rec.transition('starting', { via: 'startRecording' })) {
+    return { ok: false, error: userFacing('Already recording', 'CAPTURE') };
+  }
+
+  const failStart = (err) => {
+    recToIdle(String(err || 'start-failed'));
+    return { ok: false, error: userFacing(err, 'CAPTURE') };
+  };
+
+  const free = getFreeDiskBytes();
+  if (free != null && free <= diskSpaceLimitBytes()) {
+    return failStart('Disk space is too low');
+  }
 
   // If startup probe hasn't finished / failed transiently, retry once now
   if (!ffmpegCaps.available) {
@@ -4699,10 +4973,7 @@ async function startRecording() {
 
   if (!ffmpegCaps.available) {
     showFfmpegWarning(ffmpegCaps);
-    return {
-      ok: false,
-      error: 'FFmpeg not found. Put ffmpeg.exe in the ffmpeg/ folder or install it and add to PATH.'
-    };
+    return failStart('FFmpeg not found. Put ffmpeg.exe in the ffmpeg/ folder or install it and add to PATH.');
   }
 
   // Instant Replay holds DXGI — release it before a live recording
@@ -4821,8 +5092,10 @@ async function startRecording() {
         session.useLoopback = false;
         session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
         appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
+        maybeExplainAudioFallback();
         if (!audioDevice && !session.useWasapi) {
           notifyUser('No game audio source — recording will be silent');
+          maybeExplainAudioFallback();
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('recording-state', {
               ...getStatePayload(),
@@ -4835,6 +5108,7 @@ async function startRecording() {
   }
 
   launchSegment();
+  if (!rec.transition('recording', { via: 'desktop' })) rec.force('recording', { via: 'desktop' });
   startDesktopGameWatch();
   startStatsPolling();
   updateTrayMenu();
@@ -4845,10 +5119,13 @@ async function startRecording() {
 
 async function pauseRecording() {
   if (!isRecording) return { ok: false, error: 'Not recording' };
+  if (rec.isBusyStop()) return { ok: false, error: 'Already stopping' };
+  if (!rec.canPause() && rec.phase !== 'recording') return { ok: false, error: 'Not recording' };
   stopDesktopGameWatch();
   if (medal.recording) {
     isPaused = true;
     pauseStartedAt = Date.now();
+    rec.transition('paused', { via: 'pause-medal' });
     updateTrayMenu();
     broadcastState();
     showMainWindow();
@@ -4868,6 +5145,7 @@ async function pauseRecording() {
 
   isPaused = true;
   pauseStartedAt = Date.now();
+  rec.transition('paused', { via: 'pause' });
   updateTrayMenu();
   broadcastState();
   showMainWindow();
@@ -4877,12 +5155,14 @@ async function pauseRecording() {
 async function resumeRecording() {
   if (!isRecording) return { ok: false, error: 'Not recording' };
   if (!isPaused) return { ok: false, error: 'Not paused' };
+  if (rec.isBusyStop()) return { ok: false, error: 'Already stopping' };
   if (medal.recording) {
     if (pauseStartedAt) {
       totalPausedMs += Date.now() - pauseStartedAt;
       pauseStartedAt = null;
     }
     isPaused = false;
+    rec.transition('recording', { via: 'resume-medal' });
     updateTrayMenu();
     broadcastState();
     return { ok: true, isPaused: false };
@@ -4896,6 +5176,7 @@ async function resumeRecording() {
 
   nextSegmentPath(); // advances segmentIndex for segment-2, segment-3, ...
   isPaused = false;
+  rec.transition('recording', { via: 'resume' });
   try { if (loopbackWin && !loopbackWin.isDestroyed()) loopbackWin.webContents.send('loopback-control', 'resume'); } catch (e) { /* ignore */ }
   launchSegment();
   startDesktopGameWatch();
@@ -4905,12 +5186,17 @@ async function resumeRecording() {
 }
 
 async function stopRecording() {
-  if (!isRecording) return { ok: false, error: 'Not recording' };
+  if (rec.isBusyStop()) return { ok: false, error: 'Already stopping' };
+  if (!isRecording && !rec.canStop()) return { ok: false, error: 'Not recording' };
+  rec.transition('stopping', { via: 'stopRecording' });
   stopDesktopGameWatch();
   playCue('stop');
   if (medal.recording) return stopMedalRecording();
   if (usingGameCapture) return stopGameCapture();
-  if (!session) return { ok: false, error: 'Not recording' };
+  if (!session) {
+    recToIdle('no-session');
+    return { ok: false, error: 'Not recording' };
+  }
 
   const activeSession = session;
 
@@ -4931,37 +5217,48 @@ async function stopRecording() {
     if (last && !activeSession.segments.includes(last)) {
       activeSession.segments.push(last);
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    diag.warn('STORAGE', 'Could not track final segment', { err: e.message || String(e) });
+  }
 
+  rec.transition('finalizing', { via: 'desktop-mux' });
   let concatError = null;
   let finalSize = 0;
   try {
-      if (activeSession.segments.length === 0) {
+    if (activeSession.segments.length === 0) {
       concatError = 'No video was captured (0 bytes). Leave the game in exclusive fullscreen, turn Game Mode + Fullscreen capture ON, then press Ctrl+Shift+R.';
     } else {
-      concatSegments(activeSession.segments, activeSession.finalFile);
+      await concatSegments(activeSession.segments, activeSession.finalFile);
       currentOutputFile = activeSession.finalFile;
       if (audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048) {
         try {
-          muxLoopbackAudio(currentOutputFile, audioFile, currentOutputFile);
+          await muxLoopbackAudio(currentOutputFile, audioFile, currentOutputFile);
         } catch (e) {
-          console.warn('Could not mux desktop audio:', e.message || e);
+          diag.warn('AUDIO', 'Could not mux desktop audio', { err: e.message || String(e) });
         }
       }
-      try {
-        finalSize = fs.existsSync(currentOutputFile) ? fs.statSync(currentOutputFile).size : 0;
-      } catch (e) { finalSize = 0; }
-      if (finalSize < 8192) {
-        concatError = 'Recording file is empty/too small. Keep Game Mode + Fullscreen capture ON, start the game fullscreen first, then Ctrl+Shift+R.';
-        try { if (fs.existsSync(currentOutputFile)) fs.unlinkSync(currentOutputFile); } catch (e) { /* ignore */ }
+      const verified = verifyFinalFile(currentOutputFile, {
+        wantAudio: Boolean(settings.recordAudio && !activeSession.audioDropped && (audioFile || activeSession.useWasapi || activeSession.audioOpened))
+      });
+      finalSize = verified.size || 0;
+      if (!verified.ok) {
+        concatError = verified.reason === 'no-audio'
+          ? 'Recording saved but audio is missing.'
+          : 'Recording file is empty/too small. Keep Game Mode + Fullscreen capture ON, start the game fullscreen first, then Ctrl+Shift+R.';
+        if (verified.reason !== 'no-audio') {
+          try { if (fs.existsSync(currentOutputFile) && fs.statSync(currentOutputFile).size < 8192) fs.unlinkSync(currentOutputFile); } catch (e) { /* keep */ }
+        } else {
+          concatError = null;
+        }
       }
     }
   } catch (e) {
     concatError = e.message || String(e);
-    console.error('Concat failed:', e);
+    diag.error('STORAGE', 'Concat failed', { err: concatError });
   }
 
-  rmSessionFolder(activeSession.folder);
+  if (!concatError) rmSessionFolder(activeSession.folder);
+  else diag.warn('STORAGE', 'Keeping session folder after failed finalize', { folder: activeSession.folder });
 
   isRecording = false;
   isPaused = false;
@@ -4973,22 +5270,28 @@ async function stopRecording() {
   resetCaptureStats();
   stopStatsPolling();
 
-  // Resume Instant Replay buffer if it was paused for this recording
   await resumeReplayAfterRecording();
+
+  if (concatError) recToIdle('finalize-failed');
+  else {
+    rec.transition('completed', { via: 'desktop-mux' });
+    rec.transition('idle', { via: 'desktop-mux' });
+  }
 
   updateTrayMenu();
   broadcastState();
   restoreMainWindow();
 
   if (concatError) {
+    const f = friendlyError(concatError, 'CAPTURE');
     dialog.showMessageBox(mainWindow || undefined, {
       type: 'warning',
-      title: 'Recording failed',
-      message: 'Nothing usable was saved.',
-      detail: concatError,
+      title: f.title,
+      message: f.message,
+      detail: f.hint || concatError,
       buttons: ['OK']
     });
-    return { ok: false, error: concatError, file: currentOutputFile };
+    return { ok: false, error: userFacing(concatError, 'CAPTURE'), file: currentOutputFile };
   }
   return { ok: true, file: currentOutputFile, fileSize: finalSize };
 }
@@ -5068,19 +5371,26 @@ function registerGlobalHotkeys() {
   };
 
   const recOk = bind(settings.hotkey, () => {
-    if (isRecording) stopRecording();
+    if (!hotkeyDebounce.rec()) return;
+    diag.info('HOTKEY', 'record');
+    if (isRecording || rec.canStop()) stopRecording();
     else startRecording();
   });
   const pauseOk = bind(settings.pauseHotkey, () => {
+    if (!hotkeyDebounce.pause()) return;
     if (!isRecording) return;
+    diag.info('HOTKEY', 'pause');
     if (isPaused) resumeRecording();
     else pauseRecording();
   });
   const clipOk = bind(settings.replayHotkey, () => {
+    if (!hotkeyDebounce.clip()) return;
     if (!settings.instantReplayEnabled && !medal.active) return;
+    diag.info('HOTKEY', 'replay-save');
     saveInstantReplay();
   });
   const markOk = bind(settings.bookmarkHotkey, () => {
+    if (!hotkeyDebounce.mark()) return;
     markReplayBookmark();
   });
 
@@ -5138,12 +5448,6 @@ function resolveLibraryFile(filePath) {
     return null;
   }
   return resolved;
-}
-
-function parseDurationSeconds(text) {
-  const m = String(text || '').match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-  if (!m) return 0;
-  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
 function probeRecordingFile(filePath) {
@@ -5434,6 +5738,11 @@ ipcMain.handle('list-audio-devices', () => {
     devices: probe.devices,
     hint: probe.hint,
     warning: probe.warning,
+    showDevicePicker: Boolean(
+      settings.recordAudio &&
+      settings.audioSource !== 'mic' &&
+      !probe.wasapiWorks
+    ),
     audioSource: settings.audioSource === 'mic' ? 'mic' : 'system',
     preferred: probe.preferred,
     loopbackKind: probe.loopbackKind,
@@ -5461,6 +5770,19 @@ ipcMain.handle('toggle-instant-replay', (e, enable) => toggleInstantReplay(enabl
 ipcMain.handle('save-instant-replay', (e, saveMinutes) => saveInstantReplay(saveMinutes));
 ipcMain.handle('get-instant-replay-state', () => getInstantReplayState());
 ipcMain.handle('get-state', () => getStatePayload());
+ipcMain.handle('get-diagnostics', () => ({
+  recPhase: rec.phase,
+  captureHealthy: Boolean(isRecording && !isPaused && !captureUnhealthy),
+  encoder: (hardwareInfo.encoder && hardwareInfo.encoder.label) || null,
+  ddagrab: Boolean(ffmpegCaps.hasDdagrab),
+  wasapi: Boolean(ffmpegCaps.hasWasapi),
+  audioRoute: audioProbe.loopbackKind || null,
+  diskFreeBytes: lastDiskFreeBytes,
+  diskLimitBytes: diskSpaceLimitBytes(),
+  replay: getInstantReplayState(),
+  recent: diag.recent(),
+  log: diag.snapshot()
+}));
 ipcMain.handle('forget-unstable-game', (_e, id) => forgetUnstableGame(id));
 ipcMain.handle('choose-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory'] });
@@ -5542,21 +5864,26 @@ app.whenReady().then(() => {
         refreshAudioProbe({ testWasapi: true });
         appendDiagnosticsLine(`Audio probe: ${describeAudioRoute()}`);
         writeDiagnosticsLog();
+        maybeExplainAudioFallback();
       } catch (audioErr) {
         console.warn('Audio probe failed:', audioErr.message || audioErr);
       }
 
       try {
-        const recovered = recoverCrashedRecordings();
+        rec.transition('recovering', { via: 'startup' });
+        const recovered = await recoverCrashedRecordings();
+        rec.transition('recovered', { via: 'startup' });
+        rec.transition('idle', { via: 'startup' });
         if (recovered.length) {
           const msg = recovered.length === 1
-            ? 'Recovered 1 recording from last session'
+            ? 'Recovered recording from last session'
             : `Recovered ${recovered.length} recordings from last session`;
           notifyUser(msg);
-          appendDiagnosticsLine(`Recovery: ${msg} (${recovered.map((p) => path.basename(p)).join(', ')})`);
+          diag.info('RECOVERY', msg, { count: recovered.length });
         }
       } catch (recErr) {
-        console.warn('Crash recovery failed:', recErr.message || recErr);
+        recToIdle('recovery-failed');
+        diag.error('RECOVERY', 'Crash recovery failed', { err: recErr.message || String(recErr) });
       }
 
       startDiskSpacePolling();
@@ -5585,13 +5912,22 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (e) => {
-  if (quittingClean || !isRecording) return;
+  if (quittingClean) return;
+  const needsStop = isRecording || rec.isActive() || replaySaveQueue.busy;
+  if (!needsStop) return;
   e.preventDefault();
   quittingClean = true;
+  const quitTimeout = setTimeout(() => {
+    diag.warn('SYSTEM', 'Clean quit timed out after 8s — force exiting');
+    app.exit(0);
+  }, 8000);
   Promise.resolve()
-    .then(() => stopRecording())
-    .catch((err) => console.warn('Clean stop on quit failed:', err && err.message))
-    .finally(() => app.quit());
+    .then(() => (isRecording || rec.isActive() ? stopRecording() : null))
+    .catch((err) => diag.warn('SYSTEM', 'Clean stop on quit failed', { err: err && err.message }))
+    .finally(() => {
+      clearTimeout(quitTimeout);
+      app.quit();
+    });
 });
 
 app.on('will-quit', () => {
@@ -5600,17 +5936,17 @@ app.on('will-quit', () => {
   stopPttWatcher();
   stopGameWatch();
   stopPowerSave();
+  stopAudioDevicePolling();
   if (gameCaptureWin && !gameCaptureWin.isDestroyed()) {
     try { gameCaptureWin.webContents.send('game-capture-stop'); } catch (e) { /* ignore */ }
   }
-  if (ffmpegProcess) {
-    try { ffmpegProcess.stdin.write('q'); } catch (e) {
-      try { ffmpegProcess.kill(); } catch (e2) { /* ignore */ }
+  const killProc = (proc) => {
+    if (!proc) return;
+    try { proc.stdin.write('q'); } catch (e) {
+      try { proc.kill(); } catch (e2) { /* ignore */ }
     }
-  }
-  if (replayProcess) {
-    try { replayProcess.stdin.write('q'); } catch (e) {
-      try { replayProcess.kill(); } catch (e2) { /* ignore */ }
-    }
-  }
+  };
+  killProc(ffmpegProcess);
+  killProc(replayProcess);
+  closeMedalPartialFiles();
 });

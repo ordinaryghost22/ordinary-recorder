@@ -834,6 +834,8 @@ kbd {
   cursor: pointer;
 }
 
+.setting-row[hidden] { display: none !important; }
+
 .setting-row + .setting-row {
   border-top: 1px solid var(--border-subtle);
 }

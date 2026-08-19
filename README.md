@@ -56,8 +56,8 @@ The app stays in the tray when you close the window. Quit from the tray menu.
   30s–5 min with **Ctrl+Shift+I** (or the Clips page)
 - **Exclusive fullscreen / game capture** — if a game takes over the screen,
   press the record hotkey while that game is in front
-- **Audio** — WASAPI loopback when it works (no Stereo Mix required). Test
-  Audio in Settings. Per-source Game/Mic meters while recording
+- **Audio** — game sound is captured automatically. Press **Test Audio** in
+  Settings to confirm game + mic. Per-source meters while recording
 - **Hotkeys** — click a shortcut, then press the new keys. Defaults:
   Ctrl+Shift+R record, Ctrl+Shift+P pause, Ctrl+Shift+I clip,
   Ctrl+Shift+B bookmark a moment in the replay buffer
@@ -85,9 +85,8 @@ Trimmed clips are new files; originals are never overwritten.
   by itself).
 - **Game Capture / Exclusive Fullscreen**: keep these on to also catch games
   that take over the display
-- **Game Audio + Audio Device**: WASAPI loopback is preferred when FFmpeg can
-  open it. Stereo Mix / VB-CABLE are fallbacks only. Use **Test Audio** to
-  hear a 3-second capture before a real take
+- **Audio**: game sound is captured automatically from your speakers or
+  headphones. Use **Test Audio** to hear a 3-second clip before a real take
 - **Instant Replay buffer**: length is capped from system RAM and current
   resolution/fps. The UI shows estimated RAM use as you change those settings.
   Bookmark moments with Ctrl+Shift+B while the buffer is live; they are stored
@@ -113,15 +112,13 @@ folder. Make sure the `ffmpeg/` folder with `ffmpeg.exe` sits next to it,
 or is on PATH.
 
 ## Notes on audio capture
-Windows doesn't always expose "Stereo Mix" by default. To enable it:
-1. Right-click the speaker icon in the taskbar → Sounds → Recording tab
-2. Right-click empty space → "Show Disabled Devices"
-3. Enable "Stereo Mix" if it appears
+Game sound is captured automatically from whatever is playing on the PC.
+There is nothing to enable for a normal Windows 10/11 setup. Press **Test
+Audio** in Settings if you want to confirm before a real recording.
 
-If it's not available on your audio driver, a virtual audio cable app
-(e.g. VB-Audio Virtual Cable, free) works as a drop-in replacement — pick it
-in **Audio Device**. The app prefers WASAPI loopback when FFmpeg supports it,
-so many machines need no extra device.
+Stereo Mix or a virtual cable are only used if that automatic path fails
+(unusual drivers or very old Windows). The app will explain what to do in
+that case.
 
 ## How it stays lightweight
 - **ddagrab**: captures frames via Windows' GPU-based Desktop Duplication
@@ -147,6 +144,6 @@ so many machines need no extra device.
   folder.
 - **Recording stopped — disk space low**: raise Disk Reserve in Settings or
   free space on the output drive, then start again.
-- **No audio**: keep Game Audio on. If WASAPI is missing, enable Stereo Mix
-  or install VB-CABLE, then use Test Audio. The Settings page explains which
-  loopback source was detected.
+- **No audio**: press Test Audio in Settings while a game or video is playing.
+  If the test is silent, the app will tell you about the rare Stereo Mix /
+  virtual-cable backup. Keep Game Audio on.

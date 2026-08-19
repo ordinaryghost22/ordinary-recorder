@@ -149,7 +149,7 @@
             width: 0,
             height: 0,
             pttHeld,
-            audioLive: hasLoopback || hasMic,
+            audioLive: false,
             audioPeak,
             loopbackPeak,
             micPeak,
@@ -170,7 +170,7 @@
         micPeak *= 0.35;
         return {
           pttHeld,
-          audioLive: hasLoopback || hasMic,
+          audioLive: (lp > 0.004) || (mp > 0.004) || (peak > 0.004),
           audioPeak: peak,
           loopbackPeak: lp,
           micPeak: mp,
@@ -513,7 +513,6 @@
             width,
             height,
             ...audioStatsFields(),
-            audioLive: hasLoopback || hasMic || Boolean(stream.getAudioTracks().length),
             hasLoopback: hasLoopback || Boolean(stream.getAudioTracks().length)
           });
         }, 500);
