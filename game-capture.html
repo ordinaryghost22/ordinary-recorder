@@ -428,7 +428,7 @@
           return;
         }
         const desktopAudio = stream.getAudioTracks()[0] || null;
-        stream.getVideoTracks().forEach((t) => { t.enabled = false; });
+        stream.getVideoTracks().forEach((t) => t.stop());
         let ok = false;
         try {
           ok = await startAudioMix(desktopAudio);

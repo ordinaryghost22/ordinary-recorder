@@ -905,6 +905,11 @@ function render(state) {
     }
 
     if (wasRecording && activeView === 'clips') refreshClips();
+    if (wasRecording) showAppNotice('Recording saved');
+  }
+
+  if (!wasRecording && state.isRecording) {
+    showAppNotice('Recording started');
   }
   wasRecording = Boolean(state.isRecording);
 
@@ -983,6 +988,7 @@ saveReplayBtn.addEventListener('click', async () => {
 
   saveReplayBtn.classList.add('saved');
   saveReplayLabel.textContent = 'Clip saved';
+  showAppNotice('Clip saved');
   setStatusCopy('Ready to record', `Clip saved: ${result.file}`);
   statusLine.textContent = `Clip saved: ${result.file}`;
   if (saveFlashTimer) clearTimeout(saveFlashTimer);

@@ -1723,6 +1723,49 @@ function restoreMainWindow() {
   showMainWindow();
 }
 
+let overlayWin = null;
+let overlayTimeout = null;
+function showOverlay(text, durationMs = 2500) {
+  if (overlayTimeout) { clearTimeout(overlayTimeout); overlayTimeout = null; }
+  try {
+    const { screen } = require('electron');
+    const primary = screen.getPrimaryDisplay();
+    const { width } = primary.workAreaSize;
+    const winW = 280, winH = 48;
+    const x = Math.round(width / 2 - winW / 2);
+    const y = 18;
+
+    if (!overlayWin || overlayWin.isDestroyed()) {
+      overlayWin = new BrowserWindow({
+        width: winW, height: winH, x, y,
+        frame: false, transparent: true, alwaysOnTop: true,
+        skipTaskbar: true, resizable: false, focusable: false,
+        hasShadow: false,
+        webPreferences: { contextIsolation: true, nodeIntegration: false }
+      });
+      overlayWin.setIgnoreMouseEvents(true);
+    } else {
+      overlayWin.setBounds({ x, y, width: winW, height: winH });
+    }
+
+    const escaped = String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const html = `<html><body style="margin:0;overflow:hidden;background:transparent;display:flex;align-items:center;justify-content:center;height:100vh;">
+      <div style="background:rgba(20,20,22,0.88);color:#fff;font-family:Segoe UI,sans-serif;font-size:13px;font-weight:500;padding:10px 22px;border-radius:8px;border:1px solid rgba(255,255,255,0.1);backdrop-filter:blur(8px);letter-spacing:0.3px;">${escaped}</div>
+    </body></html>`;
+    overlayWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    overlayWin.showInactive();
+
+    overlayTimeout = setTimeout(() => {
+      if (overlayWin && !overlayWin.isDestroyed()) {
+        overlayWin.hide();
+      }
+      overlayTimeout = null;
+    }, durationMs);
+  } catch (e) {
+    console.warn('Overlay failed:', e.message);
+  }
+}
+
 function pushStableVideoEncoderArgs(args, { fps, useAmf, forReplay }) {
   const gop = fps; // 1s GOP
   const game = Boolean(settings.gameMode);
@@ -3820,6 +3863,7 @@ async function saveInstantReplayNow(saveMinutesOverride) {
 
     lastReplaySave = { ok: true, at: Date.now(), error: null, file: outputFile };
     playCue('saved');
+    showOverlay('Clip saved');
     broadcastState();
     return { ok: true, file: outputFile, segments: staged.length, saveMinutes, bookmarks: marks.bookmarks };
   } catch (e) {
@@ -4031,7 +4075,7 @@ function configureCaptureSession(win, source) {
     callback({
       video: source,
       audio: settings.recordAudio ? 'loopback' : undefined
-    });
+    }, { useSystemPicker: false });
   });
   try { win.webContents.setBackgroundThrottling(false); } catch (e) { /* ignore */ }
 }
@@ -4219,6 +4263,7 @@ function beginMedalSession() {
   updateTrayMenu();
   broadcastState();
   playCue('start');
+  showOverlay('Recording started');
   medal.workFile = path.join(settings.outputFolder, `recording-${timestamp}.partial.mkv`);
   openMedalPartialFiles(path.join(settings.outputFolder, `recording-${timestamp}.partial`));
   return { ok: true, file: currentOutputFile, mode: 'medal' };
@@ -4310,6 +4355,7 @@ async function saveMedalReplay(saveMinutes) {
   const marks = attachReplayBookmarks(outputFile, saveMinutes, saveEndedAt);
   lastReplaySave = { ok: true, at: Date.now(), error: null, file: outputFile };
   playCue('saved');
+  showOverlay('Clip saved');
   broadcastState();
   return { ok: true, file: outputFile, segments: video.length, saveMinutes, bookmarks: marks.bookmarks };
 }
@@ -4760,6 +4806,7 @@ async function startGameCapture(opts = {}) {
     pauseStartedAt = null;
     totalPausedMs = 0;
     playCue('start');
+    showOverlay('Recording started');
   } else if (recordingHandoff) {
     recordingStartedAt = recordingHandoff.startedAt || recordingStartedAt;
     totalPausedMs = recordingHandoff.totalPausedMs || 0;
@@ -5096,10 +5143,19 @@ async function startRecording() {
       session.micDevice = micDevice;
       appendDiagnosticsLine(`Audio: using WASAPI loopback (${describeAudioRoute()})`);
     } else {
-      let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
-      const hasDshowSystem = Boolean(audioDevice && !isMicrophoneDevice(audioDevice));
-
-      if (hasDshowSystem) {
+      // Prefer Chromium loopback — it captures all system audio without
+      // requiring the user to reroute output through VB-Cable.
+      try {
+        loopback = await startLoopbackCapture(sessionFolder);
+      } catch (e) {
+        loopback = { ok: false, error: e.message || String(e) };
+      }
+      if (loopback.ok) {
+        console.log('Recording desktop audio from speakers/headphones (loopback).');
+        appendDiagnosticsLine(`Audio: Chromium loopback (${describeAudioRoute()})`);
+      } else {
+        console.warn('Loopback audio failed, trying DirectShow:', loopback.error);
+        let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
         if (audioDevice && audioDevice !== settings.audioDevice) {
           settings.audioDevice = audioDevice;
           saveSettings(settings);
@@ -5107,47 +5163,22 @@ async function startRecording() {
         session.audioDevice = audioDevice;
         session.micDevice = (
           settings.audioSource !== 'mic' &&
-          settings.pttEnabled !== true
+          settings.pttEnabled !== true &&
+          audioDevice &&
+          !isMicrophoneDevice(audioDevice)
         ) ? pickMicrophoneDevice(devices) : micDevice;
         session.useLoopback = false;
-        session.useWasapi = false;
-        appendDiagnosticsLine(`Audio: DirectShow device=${audioDevice} (${describeAudioRoute()})`);
-      } else {
-        try {
-          loopback = await startLoopbackCapture(sessionFolder);
-        } catch (e) {
-          loopback = { ok: false, error: e.message || String(e) };
-        }
-        if (loopback.ok) {
-          console.log('Recording desktop audio from speakers/headphones (loopback).');
-          appendDiagnosticsLine(`Audio: Chromium loopback (${describeAudioRoute()})`);
-        } else {
-          console.warn('Loopback audio failed, trying DirectShow:', loopback.error);
-          audioDevice = audioDevice || resolveAudioDevice(devices);
-          if (audioDevice && audioDevice !== settings.audioDevice) {
-            settings.audioDevice = audioDevice;
-            saveSettings(settings);
-          }
-          session.audioDevice = audioDevice;
-          session.micDevice = (
-            settings.audioSource !== 'mic' &&
-            settings.pttEnabled !== true &&
-            audioDevice &&
-            !isMicrophoneDevice(audioDevice)
-          ) ? pickMicrophoneDevice(devices) : micDevice;
-          session.useLoopback = false;
-          session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
-          appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
+        session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
+        appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
+        maybeExplainAudioFallback();
+        if (!audioDevice && !session.useWasapi) {
+          notifyUser('No game audio source — recording will be silent');
           maybeExplainAudioFallback();
-          if (!audioDevice && !session.useWasapi) {
-            notifyUser('No game audio source — recording will be silent');
-            maybeExplainAudioFallback();
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('recording-state', {
-                ...getStatePayload(),
-                warning: audioProbe.hint
-              });
-            }
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('recording-state', {
+              ...getStatePayload(),
+              warning: audioProbe.hint
+            });
           }
         }
       }
@@ -5161,6 +5192,7 @@ async function startRecording() {
   updateTrayMenu();
   broadcastState();
   playCue('start');
+  showOverlay('Recording started');
   return { ok: true, file: currentOutputFile, replayPaused: replayPausedForRecording };
 }
 
@@ -5238,6 +5270,7 @@ async function stopRecording() {
   rec.transition('stopping', { via: 'stopRecording' });
   stopDesktopGameWatch();
   playCue('stop');
+  showOverlay('Recording saved');
   if (medal.recording) return stopMedalRecording();
   if (usingGameCapture) return stopGameCapture();
   if (!session) {
@@ -5979,6 +6012,7 @@ app.on('before-quit', (e) => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  if (overlayWin && !overlayWin.isDestroyed()) { try { overlayWin.destroy(); } catch (e) { /* ignore */ } }
   stopStatsPolling();
   stopPttWatcher();
   stopGameWatch();

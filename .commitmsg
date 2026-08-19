@@ -1,6 +1,7 @@
-fix: remove unsupported ddagrab draw_border option that broke recording
+fix: audio capture, yellow border, and add recording overlay
 
-FFmpeg 8.1.2 removed the draw_border option from ddagrab, causing
-every recording attempt to fail with "Option not found". Now probes
-for draw_border support at startup and omits it when unavailable.
-Also improves fallback to gdigrab on ddagrab option errors.
+- Use Chromium loopback for audio (captures all system audio) instead
+  of VB-Cable which requires manual routing
+- Stop video tracks in audio-only loopback to eliminate yellow border
+- Add always-on-top overlay notifications for recording start/stop/save
+- Toast notifications in renderer for recording state changes
