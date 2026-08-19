@@ -42,6 +42,7 @@ app.commandLine.appendSwitch('enable-features',
   'WebRtcAllowWgcScreenCapturer,WebRtcAllowWgcWindowCapturer,AllowWgcScreenCapturer,AllowWgcWindowCapturer,WebCodecs'
 );
 app.commandLine.appendSwitch('allow-file-access-from-files');
+app.commandLine.appendSwitch('disable-features', 'ScreenCaptureIndicator');
 
 let mainWindow = null;
 let tray = null;
@@ -410,6 +411,18 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getValidFfmpegPath() {
+  const cached = ffmpegCaps.path;
+  if (cached && cached !== 'ffmpeg') {
+    try {
+      if (fs.existsSync(cached) && fs.statSync(cached).size >= FFMPEG_MIN_BYTES) return cached;
+    } catch (e) { /* stale */ }
+    diag.warn('ENCODER', 'Cached FFmpeg path gone, re-resolving', { stale: cached });
+    ffmpegCaps.path = getFfmpegPath();
+  }
+  return getValidFfmpegPath();
+}
+
 function getFfmpegPath() {
   for (const candidate of ffmpegCandidatePaths()) {
     if (!candidate) continue;
@@ -475,7 +488,7 @@ function runFfmpegArgv(ffmpegPath, argv, timeoutMs = 20000) {
 }
 
 function runFfmpeg(args, timeoutMs = 20000) {
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   const argv = typeof args === 'string'
     ? args.trim().match(/(?:[^\s"]+|"[^"]*")+/g).map((a) => a.replace(/^"|"$/g, ''))
     : args;
@@ -498,7 +511,7 @@ function canRunFfmpeg(ffmpegPath) {
 
 /** List DirectShow audio input device names (stderr from -list_devices). */
 function listDshowAudioDevices() {
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   // FFmpeg 8 often exits 0 here — must capture stderr even on "success"
   const result = spawnSync(
     ffmpegPath,
@@ -608,7 +621,7 @@ function classifyAudioDevice(name) {
 
 function probeWasapiLoopback() {
   if (!ffmpegCaps.available || !ffmpegCaps.hasWasapi) return false;
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) return false;
   const attempts = [
     ['-f', 'wasapi', '-i', 'loopback'],
@@ -795,7 +808,7 @@ function stopAudioDevicePolling() {
 
 function testAudioCapture() {
   refreshAudioProbe({ testWasapi: true });
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) return { ok: false, error: 'FFmpeg not found' };
   const out = path.join(app.getPath('userData'), 'audio-test.m4a');
   const args = ['-hide_banner', '-y', '-nostdin'];
@@ -2164,7 +2177,7 @@ function runFfmpegAsync(ffmpegPath, argv, timeoutMs = 300000) {
 }
 
 async function concatSegments(segments, outputFile, listDir) {
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!segments.length) throw new Error('No segments to concatenate');
 
   if (segments.length === 1) {
@@ -2195,7 +2208,7 @@ async function concatSegments(segments, outputFile, listDir) {
 }
 
 async function muxLoopbackAudio(videoFile, audioFile, outputFile) {
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) throw new Error('FFmpeg missing');
   const dest = videoFile === outputFile ? `${outputFile}.with-audio.mp4` : outputFile;
   try {
@@ -2467,7 +2480,7 @@ function getFreeDiskBytes(dir) {
 }
 
 function remuxCopyToMp4(inputFile, outputFile) {
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) throw new Error('FFmpeg not found');
   const extra = [];
   if (settings.videoCodec === 'hevc' || /\.hevc$/i.test(inputFile)) extra.push('-tag:v', 'hvc1');
@@ -2498,7 +2511,7 @@ function verifyFinalFile(filePath, { wantAudio = false } = {}) {
   }
   const basic = verifyOutputBasics({ exists, size });
   if (!basic.ok) return basic;
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) return { ok: true, size, duration: 0, skippedProbe: true };
   let text = '';
   try {
@@ -2695,7 +2708,7 @@ function recoverAnnexbPair(videoFile, audioFile, metaFile, outputFile) {
       if (meta.rawFormat === 'hevc') raw = 'hevc';
     }
   } catch (e) { /* ignore */ }
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   const hasAudio = audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048;
   const argv = ['-hide_banner', '-y', '-fflags', '+genpts', '-r', String(fps), '-f', raw, '-i', videoFile];
   if (hasAudio) argv.push('-f', 's16le', '-ar', String(audioRate), '-ac', '2', '-i', audioFile, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-af', 'apad', '-shortest');
@@ -2931,7 +2944,7 @@ function launchSegment() {
 
   let fallbackStage = 0;
   let stderrBuf = '';
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) {
     console.error('No ffmpeg path available');
     return;
@@ -3258,7 +3271,7 @@ function writeReplayBookmarkSidecar(outputFile, marks, saveMinutes) {
 
 function embedReplayChapters(outputFile, marks) {
   if (!marks.length) return false;
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) return false;
   const meta = path.join(path.dirname(outputFile), `.chapters-${Date.now()}.txt`);
   const tmp = `${outputFile}.chapters.mp4`;
@@ -3943,7 +3956,7 @@ function muxMedalMp4(videoChunks, audioChunks, outputFile, fps) {
       for (const c of audioChunks) fs.writeSync(afd, c.buf);
       fs.closeSync(afd);
     }
-    const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+    const ffmpegPath = getValidFfmpegPath();
     const rate = fps || 30;
     const audioRate = medal.audioRate || 48000;
     const raw = medal.rawFormat === 'hevc' ? 'hevc' : 'h264';
@@ -4593,7 +4606,7 @@ function closeGameCaptureWindow() {
 }
 
 async function convertWebmToMp4(webmPath, mp4Path) {
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   const run = (args) => {
     execSync(`"${ffmpegPath}" ${args}`, {
       encoding: 'utf8',
@@ -5453,7 +5466,7 @@ function resolveLibraryFile(filePath) {
 function probeRecordingFile(filePath) {
   const resolved = resolveLibraryFile(filePath);
   if (!resolved) return { ok: false, error: 'That file is not in your recordings folder' };
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   let duration = 0;
   try {
     runFfmpegArgv(ffmpegPath, ['-hide_banner', '-i', resolved], 25000);
@@ -5482,7 +5495,7 @@ function formatTrimStamp(sec) {
 function trimRecordingFile({ filePath, startSec, endSec, precise }) {
   const resolved = resolveLibraryFile(filePath);
   if (!resolved) return { ok: false, error: 'That file is not in your recordings folder' };
-  const ffmpegPath = ffmpegCaps.path || getFfmpegPath();
+  const ffmpegPath = getValidFfmpegPath();
   if (!ffmpegPath) return { ok: false, error: 'FFmpeg not found' };
 
   const start = Math.max(0, Number(startSec) || 0);
