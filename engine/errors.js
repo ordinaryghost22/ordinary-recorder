@@ -31,6 +31,20 @@ function friendlyError(raw, category) {
     out.hint = 'Put ffmpeg.exe in the ffmpeg folder, or add FFmpeg to PATH.';
     return out;
   }
+  if (/option not found|non-existent option|error opening input/i.test(msg)) {
+    out.category = 'CAPTURE';
+    out.title = "Recording couldn't start";
+    out.message = 'Screen capture settings are incompatible with this FFmpeg build.';
+    out.hint = 'Ordinary will fall back automatically. If it keeps failing, set Encoder to Software x264.';
+    return out;
+  }
+  if (/ffmpeg exit|exited unexpectedly|quit while recording/i.test(msg) && detail.length < 40) {
+    out.category = 'ENCODER';
+    out.title = "Recording stopped";
+    out.message = 'The encoder quit unexpectedly.';
+    out.hint = 'Try Software x264, turn Instant Replay off briefly, then start again.';
+    return out;
+  }
   if (/encoder|nvenc|amf|qsv|libx264|codec/i.test(msg) && /fail|error|not found|cannot|unable|createcomponent/i.test(msg)) {
     out.category = 'ENCODER';
     out.title = "Recording couldn't start";

@@ -428,7 +428,9 @@
           return;
         }
         const desktopAudio = stream.getAudioTracks()[0] || null;
-        stream.getVideoTracks().forEach((t) => t.stop());
+        // Keep tracks alive (don't stop) — stopping video can kill loopback audio on some Chromium builds.
+        // Disable video so we aren't encoding screen pixels for audio-only mode.
+        stream.getVideoTracks().forEach((t) => { try { t.enabled = false; } catch (e) { /* ignore */ } });
         let ok = false;
         try {
           ok = await startAudioMix(desktopAudio);

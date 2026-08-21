@@ -419,9 +419,10 @@ function getValidFfmpegPath() {
       if (fs.existsSync(cached) && fs.statSync(cached).size >= FFMPEG_MIN_BYTES) return cached;
     } catch (e) { /* stale */ }
     diag.warn('ENCODER', 'Cached FFmpeg path gone, re-resolving', { stale: cached });
-    ffmpegCaps.path = getFfmpegPath();
   }
-  return getValidFfmpegPath();
+  const resolved = getFfmpegPath();
+  ffmpegCaps.path = resolved;
+  return resolved;
 }
 
 function getFfmpegPath() {
@@ -2285,6 +2286,39 @@ async function muxLoopbackAudio(videoFile, audioFile, outputFile) {
   }
 }
 
+/** Mux the last N seconds of a continuous loopback file onto a clip (Instant Replay). */
+async function muxLoopbackAudioTail(videoFile, audioFile, outputFile, saveMinutes) {
+  const ffmpegPath = getValidFfmpegPath();
+  if (!ffmpegPath) throw new Error('FFmpeg missing');
+  const seconds = Math.max(30, Math.round(Number(saveMinutes) * 60) || 120);
+  const dest = videoFile === outputFile ? `${outputFile}.with-audio.mp4` : outputFile;
+  const argsCopy = [
+    '-hide_banner', '-y',
+    '-i', videoFile,
+    '-sseof', `-${seconds}`,
+    '-i', audioFile,
+    '-map', '0:v:0', '-map', '1:a:0',
+    '-c:v', 'copy', '-c:a', 'aac',
+    '-b:a', '192k', '-ac', '2', '-ar', '48000', '-shortest',
+    '-movflags', '+faststart', dest
+  ];
+  try {
+    await runFfmpegAsync(ffmpegPath, argsCopy);
+  } catch (e) {
+    // Fallback without -sseof (takes from start; still better than silent)
+    await muxLoopbackAudio(videoFile, audioFile, dest === outputFile ? outputFile : dest);
+    if (dest !== outputFile && fs.existsSync(dest)) {
+      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e2) { /* ignore */ }
+      fs.renameSync(dest, outputFile);
+    }
+    return;
+  }
+  if (dest !== outputFile) {
+    try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) { /* ignore */ }
+    fs.renameSync(dest, outputFile);
+  }
+}
+
 function closeLoopbackWindow() {
   if (loopbackWin && !loopbackWin.isDestroyed()) {
     try { loopbackWin.close(); } catch (e) { /* ignore */ }
@@ -3563,7 +3597,13 @@ function startReplayProcess({ clearBuffer = false } = {}) {
   // Matroska segments — crash-recoverable rolling buffer (remuxed to mp4 on save / launch)
   const pattern = path.join(dir, 'buffer_%03d.mkv');
   const args = buildReplayArgs(pattern);
-  const ffmpegPath = ffmpegCaps.path;
+  let ffmpegPath = getValidFfmpegPath();
+  if (!ffmpegPath || ffmpegPath === 'ffmpeg') {
+    ffmpegPath = resolveBundledFfmpegPath();
+  }
+  if (!ffmpegPath) {
+    return { ok: false, error: 'FFmpeg not found' };
+  }
 
   let fallbackStage = 0;
   let stderrBuf = '';
@@ -3576,6 +3616,14 @@ function startReplayProcess({ clearBuffer = false } = {}) {
   instantReplayActive = true;
   replayPausedForRecording = false;
   softenProcessPriority(proc);
+
+  // Capture system audio alongside silent video segments; muxed on save.
+  if (settings.recordAudio && settings.audioSource !== 'mic') {
+    startLoopbackCapture(dir).then((r) => {
+      if (r && r.ok) appendDiagnosticsLine('Replay audio: Chromium loopback');
+      else if (r && r.error) diag.warn('AUDIO', 'Replay loopback failed', { err: r.error });
+    }).catch((e) => diag.warn('AUDIO', 'Replay loopback error', { err: e.message || String(e) }));
+  }
 
   proc._setReplayIntent = (v) => { replayIntent = v; };
 
@@ -3697,6 +3745,7 @@ function restartReplayProcess() {
 async function stopReplayProcess() {
   if (!replayProcess) {
     instantReplayActive = false;
+    try { await stopLoopbackCapture(); } catch (e) { /* ignore */ }
     return;
   }
   const proc = replayProcess;
@@ -3705,6 +3754,7 @@ async function stopReplayProcess() {
   await waitForProcessClose(proc);
   replayProcess = null;
   instantReplayActive = false;
+  try { await stopLoopbackCapture(); } catch (e) { /* ignore */ }
 }
 
 async function pauseReplayForRecording() {
@@ -3714,6 +3764,7 @@ async function pauseReplayForRecording() {
   }
   if (!instantReplayActive && !replayProcess) return;
   replayPausedForRecording = true;
+  try { await stopLoopbackCapture(); } catch (e) { /* ignore */ }
   if (replayProcess) {
     const proc = replayProcess;
     if (typeof proc._setReplayIntent === 'function') proc._setReplayIntent('pause');
@@ -3847,6 +3898,21 @@ async function saveInstantReplayNow(saveMinutesOverride) {
     }
 
     await concatSegments(staged, outputFile, staging);
+
+    // Attach the matching tail of continuous loopback audio (replay segments are video-only).
+    let audioFile = null;
+    try {
+      if (loopbackReady || loopbackFile) audioFile = await stopLoopbackCapture();
+    } catch (e) {
+      diag.warn('AUDIO', 'Could not stop replay loopback', { err: e.message || String(e) });
+    }
+    if (audioFile && fs.existsSync(audioFile) && fs.statSync(audioFile).size > 2048) {
+      try {
+        await muxLoopbackAudioTail(outputFile, audioFile, outputFile, saveMinutes);
+      } catch (e) {
+        diag.warn('AUDIO', 'Could not mux replay audio', { err: e.message || String(e) });
+      }
+    }
 
     const verified = verifyFinalFile(outputFile);
     if (!verified.ok) {

@@ -1,7 +1,6 @@
-fix: audio capture, yellow border, and add recording overlay
+fix: crash loop on stale ffmpeg path, silent replay, clearer errors
 
-- Use Chromium loopback for audio (captures all system audio) instead
-  of VB-Cable which requires manual routing
-- Stop video tracks in audio-only loopback to eliminate yellow border
-- Add always-on-top overlay notifications for recording start/stop/save
-- Toast notifications in renderer for recording state changes
+- getValidFfmpegPath no longer infinite-recurses when portable temp path vanishes
+- Instant Replay now captures Chromium loopback and muxes audio on save
+- Replay/record use validated ffmpeg path; stop loopback cleanly on pause/stop
+- Friendlier errors for capture option failures instead of generic "hit a problem"
