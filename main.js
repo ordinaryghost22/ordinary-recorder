@@ -2192,11 +2192,19 @@ function waitForProcessClose(proc, timeoutMs = 20000) {
 
 function sendQuit(proc) {
   if (!proc) return;
-  try {
-    proc.stdin.write('q');
-  } catch (e) {
-    try { proc.kill(); } catch (e2) { /* ignore */ }
-  }
+  // Recording/replay use -nostdin (stdin ignored), so kill the process.
+  try { proc.kill(); } catch (e) { /* ignore */ }
+}
+
+function spawnFfmpeg(ffmpegPath, args) {
+  // -nostdin prevents ffmpeg from treating a closed/inherited stdin as EOF and
+  // exiting with code 0 after a couple seconds (looks like a random crash).
+  const argv = Array.isArray(args) ? args.slice() : [];
+  if (!argv.includes('-nostdin')) argv.unshift('-nostdin');
+  return spawn(ffmpegPath, argv, {
+    windowsHide: true,
+    stdio: ['ignore', 'ignore', 'pipe']
+  });
 }
 
 function rmSessionFolder(folder) {
@@ -3038,7 +3046,7 @@ function launchSegment() {
   }
 
   console.log('ffmpeg args:', args.join(' '));
-  ffmpegProcess = spawn(ffmpegPath, args, { windowsHide: true });
+  ffmpegProcess = spawnFfmpeg(ffmpegPath, args);
   softenProcessPriority(ffmpegProcess);
   session.intent = 'running';
   stderrBuf = '';
@@ -3223,11 +3231,20 @@ function launchSegment() {
   // Unexpected exit while supposedly recording
     if (isRecording && !isPaused && intent === 'running') {
       const failMsg = stderrBuf || '';
-      if (isExclusiveFullscreenCaptureFailure(failMsg) && !usingGameCapture) {
-        console.warn('Desktop duplication blocked by fullscreen. Switching to game capture.');
-        rememberUnstableGame(foregroundGameIdentity(), 'ddagrab exited — switching to WGC');
-        switchDesktopRecordingToGame().catch((e) => console.error('game capture fallback failed:', e));
-        return;
+      if (!usingGameCapture) {
+        if (isExclusiveFullscreenCaptureFailure(failMsg) || isDdagrabFailure(failMsg)) {
+          console.warn('Desktop duplication blocked. Switching to game capture.');
+          rememberUnstableGame(foregroundGameIdentity(), 'ddagrab exited — switching to WGC');
+          switchDesktopRecordingToGame().catch((e) => console.error('game capture fallback failed:', e));
+          return;
+        }
+        // Clean exit (often stdin EOF before -nostdin) — retry once with gdigrab, don't error out.
+        if ((code === 0 || code == null) && session && session.useDdagrab) {
+          console.warn('FFmpeg ended early (code 0). Retrying with gdigrab.');
+          session.useDdagrab = false;
+          launchSegment();
+          return;
+        }
       }
       console.error('ffmpeg exited unexpectedly while recording, code=', code);
       diag.critical('ENCODER', 'FFmpeg quit while recording — keeping session files', { code, tail: String(failMsg).slice(-240) });
@@ -3451,15 +3468,29 @@ function buildReplayArgs(bufferPattern) {
   const fps = effectiveReplayFps();
   const wrap = getReplayWrapCount();
   const useDdagrab = replayUseDdagrab && ffmpegCaps.hasDdagrab;
+  const useWasapiAudio = Boolean(
+    settings.recordAudio &&
+    settings.audioSource !== 'mic' &&
+    ffmpegCaps.hasWasapi &&
+    audioProbe.wasapiWorks
+  );
   const args = [];
 
   pushDesktopCaptureArgs(args, { fps, useDdagrab });
+  if (useWasapiAudio) {
+    args.push('-thread_queue_size', '256', '-f', 'wasapi', '-i', 'loopback');
+  }
   const vf = videoFilterForCapture(useDdagrab, { useAmf: replayUseAmf });
   if (vf) args.push('-filter:v', vf);
   pushStableVideoEncoderArgs(args, { fps, useAmf: replayUseAmf, forReplay: true });
 
+  if (useWasapiAudio) {
+    args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-ar', '48000');
+  } else {
+    args.push('-an');
+  }
+
   args.push(
-    '-an',
     '-pix_fmt', 'nv12',
     '-f', 'segment',
     '-segment_time', String(REPLAY_SEGMENT_SECONDS),
@@ -3611,19 +3642,11 @@ function startReplayProcess({ clearBuffer = false } = {}) {
 
   console.log('Starting Instant Replay:', ffmpegPath, args.join(' '));
 
-  const proc = spawn(ffmpegPath, args, { windowsHide: true });
+  const proc = spawnFfmpeg(ffmpegPath, args);
   replayProcess = proc;
   instantReplayActive = true;
   replayPausedForRecording = false;
   softenProcessPriority(proc);
-
-  // Capture system audio alongside silent video segments; muxed on save.
-  if (settings.recordAudio && settings.audioSource !== 'mic') {
-    startLoopbackCapture(dir).then((r) => {
-      if (r && r.ok) appendDiagnosticsLine('Replay audio: Chromium loopback');
-      else if (r && r.error) diag.warn('AUDIO', 'Replay loopback failed', { err: r.error });
-    }).catch((e) => diag.warn('AUDIO', 'Replay loopback error', { err: e.message || String(e) }));
-  }
 
   proc._setReplayIntent = (v) => { replayIntent = v; };
 
@@ -4434,8 +4457,14 @@ const SKIP_CAPTURE_WINDOWS = /ordinary recorder|goated recorder|electron|cursor|
 const LAUNCHER_WINDOWS = /launcher|bootstrapper|easy anti-cheat|battleye|rockstar games|rgsc/i;
 
 function isGameLikeWindow(name) {
-  const n = String(name || '');
-  return Boolean(n) && !SKIP_CAPTURE_WINDOWS.test(n) && !LAUNCHER_WINDOWS.test(n);
+  const n = String(name || '').trim();
+  if (!n) return false;
+  if (SKIP_CAPTURE_WINDOWS.test(n) || LAUNCHER_WINDOWS.test(n)) return false;
+  // Broad game signals (Rage MP / FiveM / common titles)
+  if (/(multiplayer|fivem|alt:?v|rage|gta|roblox|minecraft|fortnite|valorant|league|dota|cs2|counter-strike|warzone|apex|overwatch|elden|cyberpunk)/i.test(n)) {
+    return true;
+  }
+  return !SKIP_CAPTURE_WINDOWS.test(n) && !LAUNCHER_WINDOWS.test(n);
 }
 
 function queryTopWindows() {
@@ -5131,6 +5160,15 @@ async function startRecording() {
     if (gameCap.ok) return gameCap;
     console.warn('Known-unstable game capture failed, trying desktop:', gameCap.error);
   }
+  // Rage MP / FiveM / similar — prefer WGC immediately (ddagrab dies on exclusive fullscreen)
+  if (
+    flagged &&
+    /(multiplayer|fivem|alt:?v|rage|gta)/i.test(String(flagged.title || flagged.exe || ''))
+  ) {
+    appendDiagnosticsLine(`Capture: preferring game capture for ${flagged.exe || flagged.title}`);
+    const gameCap = await startGameCapture();
+    if (gameCap.ok) return gameCap;
+  }
 
   // Fullscreen games need WGC window capture. Everything else (desktop, browsers,
   // other software, windowed/borderless games) is recorded as the whole screen.
@@ -5209,44 +5247,29 @@ async function startRecording() {
       session.micDevice = micDevice;
       appendDiagnosticsLine(`Audio: using WASAPI loopback (${describeAudioRoute()})`);
     } else {
-      // Prefer Chromium loopback — it captures all system audio without
-      // requiring the user to reroute output through VB-Cable.
-      try {
-        loopback = await startLoopbackCapture(sessionFolder);
-      } catch (e) {
-        loopback = { ok: false, error: e.message || String(e) };
+      // Never use Chromium desktop loopback here — it paints the yellow capture
+      // border. Prefer DirectShow (Stereo Mix / virtual cable). Game capture (WGC)
+      // carries its own audio when we switch for exclusive fullscreen.
+      let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
+      if (audioDevice && audioDevice !== settings.audioDevice) {
+        settings.audioDevice = audioDevice;
+        saveSettings(settings);
       }
-      if (loopback.ok) {
-        console.log('Recording desktop audio from speakers/headphones (loopback).');
-        appendDiagnosticsLine(`Audio: Chromium loopback (${describeAudioRoute()})`);
-      } else {
-        console.warn('Loopback audio failed, trying DirectShow:', loopback.error);
-        let audioDevice = getSelectedAudioDevice() || resolveAudioDevice(devices);
-        if (audioDevice && audioDevice !== settings.audioDevice) {
-          settings.audioDevice = audioDevice;
-          saveSettings(settings);
-        }
-        session.audioDevice = audioDevice;
-        session.micDevice = (
-          settings.audioSource !== 'mic' &&
-          settings.pttEnabled !== true &&
-          audioDevice &&
-          !isMicrophoneDevice(audioDevice)
-        ) ? pickMicrophoneDevice(devices) : micDevice;
-        session.useLoopback = false;
-        session.useWasapi = Boolean(settings.audioSource !== 'mic' && ffmpegCaps.hasWasapi);
-        appendDiagnosticsLine(`Audio: DirectShow fallback device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
+      session.audioDevice = audioDevice;
+      session.micDevice = (
+        settings.audioSource !== 'mic' &&
+        settings.pttEnabled !== true &&
+        audioDevice &&
+        !isMicrophoneDevice(audioDevice)
+      ) ? pickMicrophoneDevice(devices) : micDevice;
+      session.useLoopback = false;
+      session.useWasapi = false;
+      appendDiagnosticsLine(`Audio: DirectShow device=${audioDevice || '(none)'} (${describeAudioRoute()})`);
+      if (!audioDevice) {
+        notifyUser('No system audio device — desktop recording may be silent. Exclusive fullscreen games still get audio via game capture.');
         maybeExplainAudioFallback();
-        if (!audioDevice && !session.useWasapi) {
-          notifyUser('No game audio source — recording will be silent');
-          maybeExplainAudioFallback();
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('recording-state', {
-              ...getStatePayload(),
-              warning: audioProbe.hint
-            });
-          }
-        }
+      } else if (classifyAudioDevice(audioDevice) === 'vb-cable') {
+        notifyUser('Using VB-Cable for audio. Set your game/Windows output to CABLE Input, or enable Stereo Mix for auto system sound.');
       }
     }
   }
@@ -6089,9 +6112,7 @@ app.on('will-quit', () => {
   }
   const killProc = (proc) => {
     if (!proc) return;
-    try { proc.stdin.write('q'); } catch (e) {
-      try { proc.kill(); } catch (e2) { /* ignore */ }
-    }
+    try { proc.kill(); } catch (e) { /* ignore */ }
   };
   killProc(ffmpegProcess);
   killProc(replayProcess);

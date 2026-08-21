@@ -1,6 +1,6 @@
-fix: crash loop on stale ffmpeg path, silent replay, clearer errors
+fix: stop 1-2s recording death and yellow border from Chromium audio
 
-- getValidFfmpegPath no longer infinite-recurses when portable temp path vanishes
-- Instant Replay now captures Chromium loopback and muxes audio on save
-- Replay/record use validated ffmpeg path; stop loopback cleanly on pause/stop
-- Friendlier errors for capture option failures instead of generic "hit a problem"
+- Spawn FFmpeg with -nostdin so a closed stdin no longer ends capture with code 0
+- Do not use Chromium desktop loopback for system audio (that paintsthe yellow border)
+- Prefer DirectShow / game-capture audio instead; Rage/FiveM-style titles start on WGC
+- Instant Replay no longer starts Chromium loopback; recover early FFmpeg exits via gdigrab retry
