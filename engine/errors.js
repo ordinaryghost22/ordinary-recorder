@@ -45,11 +45,22 @@ function friendlyError(raw, category) {
     out.hint = 'Try Software x264, turn Instant Replay off briefly, then start again.';
     return out;
   }
-  if (/encoder|nvenc|amf|qsv|libx264|codec/i.test(msg) && /fail|error|not found|cannot|unable|createcomponent/i.test(msg)) {
+  // Do NOT match healthy libx264 end-of-encode banners ("[libx264 @ ...] kb/s:...")
+  if (
+    /nvenc|amf|qsv|h264_amf|hevc_amf|h264_nvenc|hevc_nvenc|h264_qsv|hevc_qsv/i.test(msg) &&
+    /fail|error|not found|cannot|unable|createcomponent|encoder not found|failed to open/i.test(msg)
+  ) {
     out.category = 'ENCODER';
     out.title = "Recording couldn't start";
     out.message = 'Ordinary could not initialize the selected hardware encoder.';
-    out.hint = 'We can try a safer recording configuration — set Encoder to Auto, or pick software x264.';
+    out.hint = 'Set Encoder to Software x264 in Settings, then try again.';
+    return out;
+  }
+  if (/libx264/i.test(msg) && /fail|error initializing|failed to open|encoder not found/i.test(msg) && !/kb\/s:/i.test(msg)) {
+    out.category = 'ENCODER';
+    out.title = "Recording couldn't start";
+    out.message = 'Software encoder failed to start.';
+    out.hint = 'Restart Ordinary and try again. If it keeps failing, free some RAM/CPU.';
     return out;
   }
   if (/ddagrab|desktop duplication|acquireNextFrame|887a0026|887a0027|selected output not supported/i.test(msg)) {
