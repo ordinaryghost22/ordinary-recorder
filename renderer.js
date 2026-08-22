@@ -338,7 +338,7 @@ function startTick() {
   tickStartedAt = Date.now();
   tickTimer = setInterval(() => {
     timerDisplay.textContent = formatElapsed(currentElapsed());
-  }, 250);
+  }, 500);
 }
 
 function formatSaveLabel(minutes) {
@@ -1235,7 +1235,27 @@ window.addEventListener('blur', () => {
   if (listeningBind) stopListening();
 });
 
-window.recorder.onStateChange((state) => render(state));
+window.recorder.onStateChange((state) => {
+  // Cap UI re-renders to 2x/sec while recording (meters/stats)
+  if (state && state.isRecording) {
+    const now = Date.now();
+    if (window._recUiAt && now - window._recUiAt < 500) {
+      window._recUiPending = state;
+      if (!window._recUiTimer) {
+        window._recUiTimer = setTimeout(() => {
+          window._recUiTimer = null;
+          window._recUiAt = Date.now();
+          const s = window._recUiPending;
+          window._recUiPending = null;
+          if (s) render(s);
+        }, 500);
+      }
+      return;
+    }
+    window._recUiAt = now;
+  }
+  render(state);
+});
 if (window.recorder.onNotice) {
   window.recorder.onNotice((payload) => {
     const msg = payload && payload.message ? payload.message : payload;

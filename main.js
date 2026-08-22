@@ -159,18 +159,18 @@ const settingsPath = path.join(app.getPath('userData'), 'settings.json');
 
 const REPLAY_SEGMENT_SECONDS = 10;
 
-const SETTINGS_VERSION = 11;
+const SETTINGS_VERSION = 12;
 
 const defaultSettings = {
   settingsVersion: SETTINGS_VERSION,
   fps: 30,
   gameMode: true,
-  exclusiveFullscreen: true,
+  exclusiveFullscreen: false,
   spaceSaving: true,
   amfRateControl: 'vbr_peak',
   encoder: 'auto',
   videoCodec: 'h264',
-  outputResolution: 'native',
+  outputResolution: '1080',
   audioSource: 'system',
   recordAudio: true,
   audioDevice: null,
@@ -242,12 +242,22 @@ function loadSettings() {
         loaded.bookmarkHotkey = loaded.bookmarkHotkey || 'CommandOrControl+Shift+B';
         migrated = true;
       }
+      if (!Number.isFinite(ver) || ver < 12) {
+        // Low-end defaults: 30fps, cap at 1080p, auto HW encoder, light encode
+        loaded.fps = 30;
+        loaded.instantReplayFps = Math.min(30, Number(loaded.instantReplayFps) || 30);
+        loaded.outputResolution = '1080';
+        loaded.encoder = 'auto';
+        loaded.spaceSaving = true;
+        loaded.exclusiveFullscreen = false;
+        migrated = true;
+      }
       if (migrated) loaded.settingsVersion = SETTINGS_VERSION;
       loaded.encoder = ['auto', 'nvenc', 'amf', 'qsv', 'x264'].includes(loaded.encoder) ? loaded.encoder : 'auto';
       loaded.videoCodec = ['h264', 'hevc', 'av1'].includes(loaded.videoCodec) ? loaded.videoCodec : 'h264';
       loaded.outputResolution = ['native', '1440', '1080', '720'].includes(loaded.outputResolution)
         ? loaded.outputResolution
-        : 'native';
+        : '1080';
       loaded.wizardCompleted = loaded.wizardCompleted === true;
       loaded.instantReplayMinutes = Math.min(5, Math.max(1, Number(loaded.instantReplayMinutes) || 5));
       const saveOpts = [0.5, 1, 2, 3, 4, 5];
@@ -1109,15 +1119,22 @@ function refreshSelectedEncoder() {
 }
 
 function captureBitrateBps({ forReplay = false } = {}) {
+  // Hard ceiling for low-end PCs — users can still raise resolution/fps in settings,
+  // but encode bitrate never exceeds 6 Mbps by default pipeline.
+  const MAX_BITS = 6_000_000;
   const codec = (hardwareInfo.encoder && hardwareInfo.encoder.codec) || settings.videoCodec || 'h264';
-  let bits = 8_000_000;
-  if (forReplay) bits = 5_000_000;
-  else if (settings.spaceSaving) bits = 8_000_000;
-  else if (!settings.gameMode) bits = 10_000_000;
-  else bits = 8_000_000;
+  let bits = forReplay ? 4_000_000 : 5_000_000;
   if (codec === 'hevc') bits = Math.round(bits * 0.65);
   if (codec === 'av1') bits = Math.round(bits * 0.5);
-  return bits;
+  return Math.min(MAX_BITS, bits);
+}
+
+function encodeCrf() {
+  return 30;
+}
+
+function encodeMaxBitrate() {
+  return '6M';
 }
 
 function estimateFileBytesPerMinute() {
@@ -1135,6 +1152,8 @@ function capturePixelSize() {
     if (r === '720') return { width: Math.round(w * (720 / h)), height: 720 };
     if (r === '1080') return { width: Math.round(w * (1080 / h)), height: 1080 };
     if (r === '1440') return { width: Math.round(w * (1440 / h)), height: 1440 };
+    // native still caps at 1080p for encode cost on weak PCs
+    if (h > 1080) return { width: Math.round(w * (1080 / h)), height: 1080 };
     return { width: w, height: h };
   } catch (e) {
     return { width: 1920, height: 1080 };
@@ -1177,36 +1196,23 @@ function maxReplayMinutesForRam() {
 
 function wizardDefaultsForTier(tier) {
   const hevcOk = Boolean(ffmpegCaps.hasHevcNvenc || ffmpegCaps.hasHevcAmf || ffmpegCaps.hasHevcQsv);
-  const ramGB = hardwareInfo.ramBytes / (1024 ** 3);
-  const vramGB = hardwareInfo.vramBytes / (1024 ** 3);
-  if (tier === 'low') {
+  // Out-of-the-box always assumes weak hardware; strong PCs raise fps/res in Settings.
+  if (tier === 'high') {
     return {
       fps: 30,
-      outputResolution: '720',
-      instantReplayMinutes: 2,
-      instantReplaySaveMinutes: 1,
-      videoCodec: 'h264',
+      outputResolution: '1080',
+      instantReplayMinutes: 5,
+      instantReplaySaveMinutes: 2,
+      videoCodec: hevcOk ? 'hevc' : 'h264',
       spaceSaving: true,
       encoder: 'auto'
     };
   }
-  if (tier === 'high') {
-    const fps = ramGB >= 32 && vramGB >= 8 ? 144 : 60;
-    return {
-      fps,
-      outputResolution: vramGB >= 6 ? '1440' : '1080',
-      instantReplayMinutes: 5,
-      instantReplaySaveMinutes: 2,
-      videoCodec: hevcOk ? 'hevc' : 'h264',
-      spaceSaving: false,
-      encoder: 'auto'
-    };
-  }
   return {
-    fps: 60,
-    outputResolution: '1080',
-    instantReplayMinutes: 3,
-    instantReplaySaveMinutes: 2,
+    fps: 30,
+    outputResolution: tier === 'low' ? '720' : '1080',
+    instantReplayMinutes: tier === 'low' ? 2 : 3,
+    instantReplaySaveMinutes: tier === 'low' ? 1 : 2,
     videoCodec: 'h264',
     spaceSaving: true,
     encoder: 'auto'
@@ -1336,25 +1342,61 @@ function scaleFilterForResolution() {
   if (r === '720') return 'scale=-2:720';
   if (r === '1080') return 'scale=-2:1080';
   if (r === '1440') return 'scale=-2:1440';
+  // native: still downscale anything above 1080p before encode (low-end default)
+  try {
+    const disp = screen.getPrimaryDisplay();
+    const h = (disp && disp.size && disp.size.height) || 1080;
+    if (h > 1080) return 'scale=-2:1080';
+  } catch (e) { /* ignore */ }
   return null;
 }
 
 function pushVendorEncoderArgs(args, { fps, forReplay, encoder }) {
   const gop = fps;
   const bits = captureBitrateBps({ forReplay });
-  const maxrate = Math.round(bits * 1.25);
-  const bufsize = Math.round(bits * 1.5);
+  const maxrate = Math.min(6_000_000, Math.round(bits * 1.2));
+  const bufsize = Math.round(maxrate * 1.5);
   const name = encoder.ffmpegName;
+  const crf = encodeCrf();
   args.push('-c:v', name);
   if (encoder.family === 'nvenc') {
-    args.push('-preset', 'p4', '-rc', 'vbr', '-b:v', String(bits), '-maxrate', String(maxrate), '-bufsize', String(bufsize), '-g', String(gop), '-bf', '0');
+    args.push(
+      '-preset', 'p4',
+      '-rc', 'vbr',
+      '-cq', String(crf),
+      '-b:v', String(bits),
+      '-maxrate', String(maxrate),
+      '-bufsize', String(bufsize),
+      '-g', String(gop),
+      '-bf', '0'
+    );
     if (encoder.codec !== 'av1') args.push('-tune', 'll');
     if (encoder.codec === 'hevc') args.push('-tag:v', 'hvc1');
   } else if (encoder.family === 'qsv') {
-    args.push('-preset', 'veryfast', '-look_ahead', '0', '-b:v', String(bits), '-maxrate', String(maxrate), '-bufsize', String(bufsize), '-g', String(gop), '-bf', '0');
+    args.push(
+      '-preset', 'veryfast',
+      '-look_ahead', '0',
+      '-global_quality', String(crf),
+      '-b:v', String(bits),
+      '-maxrate', String(maxrate),
+      '-bufsize', String(bufsize),
+      '-g', String(gop),
+      '-bf', '0'
+    );
     if (encoder.codec === 'hevc') args.push('-tag:v', 'hvc1');
   } else if (encoder.family === 'amf') {
-    args.push('-usage', 'transcoding', '-quality', 'speed', '-rc', 'vbr_peak', '-b:v', String(bits), '-maxrate', String(maxrate), '-bufsize', String(bufsize), '-g', String(gop), '-bf', '0');
+    args.push(
+      '-usage', 'ultralowlatency',
+      '-quality', 'speed',
+      '-rc', 'vbr_latency',
+      '-qp_i', String(crf),
+      '-qp_p', String(Math.min(51, crf + 2)),
+      '-b:v', String(bits),
+      '-maxrate', String(maxrate),
+      '-bufsize', String(bufsize),
+      '-g', String(gop),
+      '-bf', '0'
+    );
     if (encoder.codec === 'hevc') args.push('-tag:v', 'hvc1');
   }
 }
@@ -1661,6 +1703,9 @@ function pushDesktopCaptureArgs(args, { fps, useDdagrab }) {
     if (ffmpegCaps.ddagrabHasDrawBorder) ddaOpts += ':draw_border=0';
     args.push('-f', 'lavfi', '-i', ddaOpts);
   } else {
+    diag.warn('CAPTURE', 'Using GDI grab (last resort) — higher CPU cost than Desktop Duplication');
+    console.warn('GDI fallback active (absolute last resort). Prefer ddagrab / game capture.');
+    appendDiagnosticsLine('Capture: GDI fallback (last resort — higher CPU)');
     args.push(
       '-thread_queue_size', game ? '1024' : '256',
       '-f', 'gdigrab',
@@ -1697,6 +1742,8 @@ function cueFile(kind) {
 }
 
 function playCue(kind) {
+  // No mid-recording cue spawns (bookmark) — PowerShell SoundPlayer costs CPU
+  if (isRecording && kind === 'bookmark') return;
   const file = cueFile(kind);
   try {
     if (!fs.existsSync(file)) return;
@@ -1769,63 +1816,41 @@ function showOverlay(text, durationMs = 2500) {
 
 function pushStableVideoEncoderArgs(args, { fps, useAmf, forReplay }) {
   const gop = fps; // 1s GOP
-  const game = Boolean(settings.gameMode);
   const picked = pickActiveEncoder({ hardware: useAmf });
+  const crf = encodeCrf();
+  const maxrate = encodeMaxBitrate();
+  const bits = captureBitrateBps({ forReplay });
 
-  if (useAmf && picked.family === 'amf' && picked.codec === 'h264' && ffmpegCaps.hasH264Amf) {
-    // Avoid cavlc/passthrough quirks — those caused colorful block glitches on playback
-    args.push(
-      '-c:v', 'h264_amf',
-      '-usage', 'transcoding',
-      '-quality', 'speed'
-    );
-
-    if (game && !forReplay && settings.amfRateControl === 'cqp') {
-      const qpI = settings.spaceSaving ? '26' : '22';
-      const qpP = settings.spaceSaving ? '28' : '24';
-      args.push(
-        '-rc', 'cqp',
-        '-qp_i', qpI,
-        '-qp_p', qpP,
-        '-g', String(gop),
-        '-bf', '0'
-      );
-    } else {
-      let bitrate = '12M';
-      let maxrate = '16M';
-      let bufsize = '24M';
-      if (forReplay) {
-        bitrate = '5M'; maxrate = '6M'; bufsize = '8M';
-      } else if (settings.spaceSaving) {
-        bitrate = '8M'; maxrate = '10M'; bufsize = '12M';
-      } else if (!game) {
-        bitrate = '10M'; maxrate = '14M'; bufsize = '18M';
-      } else {
-        bitrate = '8M'; maxrate = '10M'; bufsize = '12M';
-      }
-      args.push(
-        '-rc', 'vbr_peak',
-        '-b:v', bitrate,
-        '-maxrate', maxrate,
-        '-bufsize', bufsize,
-        '-g', String(gop),
-        '-bf', '0'
-      );
-    }
-    return;
-  }
-
+  // Always prefer hardware when available for this session
   if (useAmf && picked.hardware && picked.ffmpegName !== 'libx264') {
+    if (picked.family === 'amf' && picked.codec === 'h264' && ffmpegCaps.hasH264Amf) {
+      args.push(
+        '-c:v', 'h264_amf',
+        '-usage', 'ultralowlatency',
+        '-quality', 'speed',
+        '-rc', 'vbr_latency',
+        '-qp_i', String(crf),
+        '-qp_p', String(Math.min(51, crf + 2)),
+        '-b:v', String(bits),
+        '-maxrate', maxrate,
+        '-bufsize', '9M',
+        '-g', String(gop),
+        '-bf', '0'
+      );
+      return;
+    }
     pushVendorEncoderArgs(args, { fps, forReplay, encoder: picked });
     return;
   }
 
-  // Software fallback — keep ultrafast so games stay playable
+  // Software fallback — ultrafast + zerolatency, CRF 30, hard 6M cap
   args.push(
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
-    '-crf', settings.spaceSaving ? '26' : '21',
+    '-crf', String(crf),
+    '-maxrate', maxrate,
+    '-bufsize', '9M',
     '-g', String(gop),
     '-keyint_min', String(gop),
     '-sc_threshold', '0',
@@ -3120,7 +3145,8 @@ function launchSegment() {
     if (session.useDdagrab && isDdagrabFailure(msg)) {
       fallbackStage = 1;
       if (/not.found|non-existent option/i.test(msg)) {
-        console.warn('ddagrab options unsupported; falling back to gdigrab.');
+        console.warn('ddagrab options unsupported; falling back to gdigrab (last resort — higher CPU).');
+        diag.warn('CAPTURE', 'ddagrab options unsupported — GDI last resort');
         session.useDdagrab = false;
         restartCurrentSegment();
         return;
@@ -3240,7 +3266,8 @@ function launchSegment() {
         }
         // Clean exit (often stdin EOF before -nostdin) — retry once with gdigrab, don't error out.
         if ((code === 0 || code == null) && session && session.useDdagrab) {
-          console.warn('FFmpeg ended early (code 0). Retrying with gdigrab.');
+          console.warn('FFmpeg ended early (code 0). Retrying with gdigrab (last resort).');
+          diag.warn('CAPTURE', 'Early FFmpeg exit — GDI last resort');
           session.useDdagrab = false;
           launchSegment();
           return;
@@ -5153,33 +5180,25 @@ async function startRecording() {
   }
   replayPausedForRecording = true;
 
-  const flagged = settings.exclusiveFullscreen !== false ? foregroundGameIdentity() : null;
-  if (flagged && isKnownUnstableGame(flagged)) {
-    appendDiagnosticsLine(`Capture: skipping ddagrab for known-unstable ${flagged.exe || flagged.title}`);
-    const gameCap = await startGameCapture();
-    if (gameCap.ok) return gameCap;
-    console.warn('Known-unstable game capture failed, trying desktop:', gameCap.error);
-  }
-  // Rage MP / FiveM / similar — prefer WGC immediately (ddagrab dies on exclusive fullscreen)
-  if (
-    flagged &&
-    /(multiplayer|fivem|alt:?v|rage|gta)/i.test(String(flagged.title || flagged.exe || ''))
-  ) {
-    appendDiagnosticsLine(`Capture: preferring game capture for ${flagged.exe || flagged.title}`);
-    const gameCap = await startGameCapture();
-    if (gameCap.ok) return gameCap;
-  }
-
-  // Fullscreen games need WGC window capture. Everything else (desktop, browsers,
-  // other software, windowed/borderless games) is recorded as the whole screen.
-  let exclusiveGame = false;
-  try {
-    exclusiveGame = Boolean(findExclusiveGameWindow(await listCaptureSources()));
-  } catch (e) { /* ignore */ }
-  if (exclusiveGame) {
-    const gameCap = await startGameCapture();
-    if (gameCap.ok) return gameCap;
-    console.warn('Fullscreen game capture failed, trying full desktop:', gameCap.error);
+  // Whole-desktop recording (OBS-style display capture). Game-window capture only
+  // when the user explicitly enables Exclusive Fullscreen in Settings.
+  if (settings.exclusiveFullscreen !== false) {
+    const flagged = foregroundGameIdentity();
+    if (flagged && isKnownUnstableGame(flagged)) {
+      appendDiagnosticsLine(`Capture: skipping ddagrab for known-unstable ${flagged.exe || flagged.title}`);
+      const gameCap = await startGameCapture();
+      if (gameCap.ok) return gameCap;
+      console.warn('Known-unstable game capture failed, trying desktop:', gameCap.error);
+    }
+    let exclusiveGame = false;
+    try {
+      exclusiveGame = Boolean(findExclusiveGameWindow(await listCaptureSources()));
+    } catch (e) { /* ignore */ }
+    if (exclusiveGame) {
+      const gameCap = await startGameCapture();
+      if (gameCap.ok) return gameCap;
+      console.warn('Fullscreen game capture failed, trying full desktop:', gameCap.error);
+    }
   }
 
   if (!fs.existsSync(settings.outputFolder)) fs.mkdirSync(settings.outputFolder, { recursive: true });
@@ -5466,6 +5485,27 @@ async function stopRecording() {
 }
 
 function broadcastState() {
+  // While recording, throttle UI pushes to 2x/sec to keep CPU free for capture
+  if (isRecording) {
+    const now = Date.now();
+    if (broadcastState._lastAt && (now - broadcastState._lastAt) < 500) {
+      if (!broadcastState._pending) {
+        broadcastState._pending = setTimeout(() => {
+          broadcastState._pending = null;
+          broadcastState._lastAt = 0;
+          broadcastState();
+        }, 500 - (now - broadcastState._lastAt));
+      }
+      return;
+    }
+    broadcastState._lastAt = now;
+  } else {
+    broadcastState._lastAt = 0;
+    if (broadcastState._pending) {
+      clearTimeout(broadcastState._pending);
+      broadcastState._pending = null;
+    }
+  }
   const payload = getStatePayload();
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('recording-state', payload);

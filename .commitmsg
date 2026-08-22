@@ -1,3 +1,7 @@
-﻿fix: stop mislabeling clean libx264 exits as hardware encoder failure
+﻿chore: default the whole app to low-end PC capture/encode settings
 
-Also overwrite the user's real launch path (D:\hahaha) so they stop running the old build.
+- 30fps + 1080p cap by default (migrate existing installs to settings v12)
+- Hardware encoder first; x264 fallback uses ultrafast/zerolatency CRF 30 with 6M maxrate
+- Auto-downscale sources above 1080p; warn loudly on GDI last-resort fallback
+- Throttle recording UI/stats to 2Hz; skip bookmark cues mid-recording
+- Chromium game-capture only when Exclusive Fullscreen is enabled and a game is detected
